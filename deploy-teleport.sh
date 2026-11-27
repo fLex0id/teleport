@@ -4,11 +4,12 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-VERSION=2.1.0
+VERSION=2.1.1
 BASE=https://flex0id.github.io/teleport
 REPO_HOST=flex0id.github.io
 REPO_IPS=(185.199.108.153 185.199.109.153 185.199.110.153 185.199.111.153)
 REPO_FALLBACK_IP=
+REPO_DNS_MODE='NOT CHECKED'
 FPR=95AB1A0D022288C96B135E395D6220FDB9C74356
 CONF=/etc/teleport.yaml
 STATE=/var/lib/teleport-deploy
@@ -28,17 +29,26 @@ ask_domain(){ while :; do ask "$1"; if domain_ok "$ANSWER"; then return; fi; say
 ask_name(){ while :; do ask "$1 [$2]"; ANSWER=${ANSWER:-$2}; [[ $ANSWER =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$ ]] && return; say 'Use ASCII letters, digits, dots, hyphens or underscores.'; done; }
 run(){ local desc=$1; shift; say "$desc ..."; if "$@" >>"$LOG" 2>&1; then say '[OK]'; else say "[ERROR] See $LOG"; tail -n 12 "$LOG" >&2; return 1; fi; }
 fetch(){ curl -4fsSL --retry 3 --connect-timeout 15 --max-time 120 "$1" -o "$2"; }
+repo_report(){
+  REPO_DNS_MODE=$1
+  local message="[DNS] Repository access: $REPO_DNS_MODE"
+  say "$message"
+  printf '[%s] %s\n' "$(date -Is)" "$message" >>"$LOG" || say '[WARN] Could not write DNS status to log.'
+}
 # Only GitHub Pages downloads use this fallback. Never modify system DNS or /etc/hosts.
 # curl exit 6 means the target hostname could not be resolved.
 repo_probe(){
   local rc ip resolver candidate
-  local -a candidates=()
+  local -a candidates=() sources=()
+  local idx source
   REPO_FALLBACK_IP=
+  REPO_DNS_MODE='CHECKING'
   if curl -4fsS --connect-timeout 8 --max-time 15 "$BASE/current-release.txt" -o /dev/null; then
-    say '[OK] Repository available through normal DNS.'
+    repo_report 'NORMAL - system resolver; emergency fallback not used.'
     return 0
   else rc=$?; fi
   if ((rc != 6)); then
+    repo_report "FAILED - normal HTTPS error (curl $rc); emergency fallback not used."
     fail "Repository HTTPS failed (curl $rc); DNS fallback not applicable."
     return 1
   fi
@@ -46,23 +56,25 @@ repo_probe(){
   if command -v dig >/dev/null 2>&1; then
     for resolver in 9.9.9.9 1.1.1.1 8.8.8.8; do
       while IFS= read -r candidate; do
-        if ip_ok "$candidate"; then candidates+=("$candidate"); fi
+        if ip_ok "$candidate"; then candidates+=("$candidate"); sources+=("alternate DNS $resolver"); fi
       done < <(dig @"$resolver" "$REPO_HOST" A +time=2 +tries=1 +short 2>/dev/null || :)
       (("${#candidates[@]}" > 0)) && break
     done
   fi
-  candidates+=("${REPO_IPS[@]}")
+  for ip in "${REPO_IPS[@]}"; do candidates+=("$ip"); sources+=("static GitHub Pages IP"); done
   local seen=' '
-  for ip in "${candidates[@]}"; do
+  for idx in "${!candidates[@]}"; do
+    ip=${candidates[idx]}; source=${sources[idx]}
     [[ $seen != *" $ip "* ]] || continue
     seen+="$ip "
     if curl -4fsS --noproxy "$REPO_HOST" --connect-timeout 5 --max-time 12 \
       --resolve "$REPO_HOST:443:$ip" "$BASE/current-release.txt" -o /dev/null; then
       REPO_FALLBACK_IP=$ip
-      say "[OK] Temporary repository address: $ip"
+      repo_report "EMERGENCY - $source; verified HTTPS to $ip."
       return 0
     fi
   done
+  repo_report 'FAILED - normal DNS and emergency fallback unsuccessful.'
   fail 'No reachable GitHub Pages address with valid TLS.'
 }
 repo_fetch(){
@@ -391,8 +403,9 @@ main(){
   detect || exit 1
   while :; do
     say ''; say "Teleport deploy $VERSION"
+    say "Last repository DNS check: $REPO_DNS_MODE"
     say '1 Install main cluster'; say '2 Install SSH agent'; say '3 Configure DNS'; say '4 Restore original DNS'
-    say '5 Create administrator (main cluster)'; say '6 Generate agent token (main cluster)'; say '7 Status'; say '0 Exit'
+    say '5 Create administrator (main cluster)'; say '6 Generate agent token (main cluster)'; say '7 Status / repository DNS check'; say '0 Exit'
     choice 'Select [0]:' 0 7
     case "$ANSWER" in
       0) return 0;;
@@ -405,7 +418,7 @@ main(){
       4) dns_restore || :;;
       5) admin || say 'Could not create user.';;
       6) token_menu || say 'Could not create token.';;
-      7) teleport version || :; systemctl status teleport --no-pager || :; journalctl -u teleport -n 15 --no-pager || :;;
+      7) repo_probe || :; teleport version || :; systemctl status teleport --no-pager || :; journalctl -u teleport -n 15 --no-pager || :;;
     esac
   done
 }
