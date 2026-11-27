@@ -83,15 +83,24 @@ dns_change(){
     7) while :; do ask 'One or two IPv4 addresses, separated by space:'; ips=$ANSWER; local valid=1 count=0; for ip in $ips; do ip_ok "$ip" || valid=0; count=$((count+1)); done; ((valid && count>=1 && count<=2)) && break; say 'Invalid addresses.'; done; host='';;
   esac
   if [[ $p == 5 ]]; then
-    mode=2
-    while :; do ask 'NextDNS profile ID (6 hex characters):'; [[ $ANSWER =~ ^[a-fA-F0-9]{6}$ ]] && break; say 'Invalid profile ID.'; done
-    path="/$ANSWER"
+    choice '1 UDP (linked IP), 2 DoH (profile ID), 0 Cancel [2]:' 2 2; mode=$ANSWER
+    if [[ $mode == 2 ]]; then
+      while :; do ask 'NextDNS profile ID (6 hex characters):'; [[ $ANSWER =~ ^[a-fA-F0-9]{6}$ ]] && break; say 'Invalid profile ID.'; done
+      path="/$ANSWER"
+    elif [[ $mode == 1 ]]; then
+      say 'Use the two IPv4 addresses listed in your NextDNS Linked IP setup.'
+      while :; do ask 'Primary IPv4:'; ip_ok "$ANSWER" && { ips=$ANSWER; break; }; say 'Invalid IPv4.'; done
+      while :; do ask 'Secondary IPv4:'; ip_ok "$ANSWER" && { ips="$ips $ANSWER"; break; }; say 'Invalid IPv4.'; done
+    fi
   elif [[ $p == 7 ]]; then mode=1
   else choice '1 UDP DNS, 2 DNS over HTTPS, 0 Cancel [1]:' 1 2; mode=$ANSWER; fi
   [[ $mode != 0 ]] || return 0
   say 'This changes system-wide DNS and may affect private DNS names.'
   yesno 'Apply DNS configuration?' || return 0
   [[ ! -e $NMCONF && ! -e $DNSCONF && ! -e /etc/systemd/system/$DNSUNIT ]] || { fail 'Existing resolver configuration; refusing overwrite.'; return 1; }
+  mkdir -m 700 "$DNSBACK" || return 1
+  cp -a /etc/resolv.conf "$DNSBACK/resolv.conf" || { rmdir "$DNSBACK"; return 1; }
+  DNS_PENDING=1
   if [[ $mode == 2 ]]; then
     if ! command -v dnscrypt-proxy >/dev/null; then
       if [[ $PM == apt ]]; then run 'Install DNSCrypt proxy' apt-get install -y dnscrypt-proxy || return 1
@@ -105,13 +114,10 @@ dns_change(){
     fi
     bin=$(command -v dnscrypt-proxy) || return 1
   fi
-  mkdir -m 700 "$DNSBACK" || return 1
-  cp -a /etc/resolv.conf "$DNSBACK/resolv.conf" || { rmdir "$DNSBACK"; return 1; }
-  DNS_PENDING=1
   if [[ $mode == 2 ]]; then
     # Use the explicit endpoint IPs, no unencrypted bootstrap fallback.
     {
-      say "listen_addresses = ['127.0.2.1:53']"
+      say "listen_addresses = ['127.0.2.53:53']"
       say 'ipv4_servers = true'; say 'ipv6_servers = false'
       say 'dnscrypt_servers = false'; say 'doh_servers = true'; say 'odoh_servers = false'
       say 'ignore_system_dns = true'; say 'timeout = 5000'; say 'cache = true'
@@ -119,7 +125,7 @@ dns_change(){
       say "server_names = [$names]"
       say '[static]'
       i=0; for ip in $ips; do i=$((i+1)); stamp=$(dns_stamp "$ip" "$host" "$path") || return 1; say "[static.up$i]"; say "stamp = '$stamp'"; done
-    } >"$DNSCONF"
+    } >"$DNSCONF" || return 1
     run 'Check DoH configuration' "$bin" -config "$DNSCONF" -check || { dns_restore || :; DNS_PENDING=0; return 1; }
     cat >"/etc/systemd/system/$DNSUNIT" <<EOF
 [Unit]
@@ -137,9 +143,9 @@ EOF
     systemctl daemon-reload || return 1
     run 'Start local DoH' systemctl enable --now "$DNSUNIT" || { dns_restore || :; DNS_PENDING=0; return 1; }
     local ready=0 n
-    for n in {1..10}; do if dig @127.0.2.1 github.com A +time=2 +tries=1 +short | grep -Eq '^[0-9]+\.'; then ready=1; break; fi; sleep 1; done
+    for n in {1..10}; do if dig @127.0.2.53 github.com A +time=2 +tries=1 +short | grep -Eq '^[0-9]+\.'; then ready=1; break; fi; sleep 1; done
     ((ready)) || { fail 'DoH lookup failed'; dns_restore || :; DNS_PENDING=0; return 1; }
-    ips=127.0.2.1
+    ips=127.0.2.53
   else
     local ready=0
     for ip in $ips; do if dig @"$ip" github.com A +time=3 +tries=1 +short | grep -Eq '^[0-9]+\.'; then ready=1; break; fi; done
@@ -153,10 +159,10 @@ EOF
   fi
   # Detach from systemd-resolved stub; do not stop other network services.
   local tmp; tmp=$(mktemp /etc/.teleport-resolv.XXXXXX) || return 1
-  { say '# Managed by deploy-teleport.sh'; for ip in $ips; do say "nameserver $ip"; done; say 'options timeout:2 attempts:2'; } >"$tmp"
+  { say '# Managed by deploy-teleport.sh'; for ip in $ips; do say "nameserver $ip"; done; say 'options timeout:2 attempts:2'; } >"$tmp" || return 1
   chmod 644 "$tmp" && mv -Tf "$tmp" /etc/resolv.conf || return 1
   if command -v restorecon >/dev/null; then restorecon /etc/resolv.conf || :; fi
-  if dns_test; then DNS_PENDING=0; say '[OK] DNS configured. Use menu 4 to restore.'; else dns_restore || :; DNS_PENDING=0; return 1; fi
+  if dns_test; then DNS_PENDING=0; say '[OK] DNS configured. Use menu 4 to restore.'; say 'Check NSS/systemd-resolved and DHCP configuration if applications use another resolver or DNS changes after reboot.'; else dns_restore || :; DNS_PENDING=0; return 1; fi
 }
 install_package(){
   fetch https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh "$TMP/install-repo.sh" || return 1
@@ -164,12 +170,19 @@ install_package(){
   if [[ $PM == apt ]]; then
     local version; version=$(curl -4fsSL --max-time 30 "$BASE/current-release.txt") || return 1
     version=$(printf '%s' "$version" | sed -E 's/^(teleport-v|v)//')
-    apt-cache madison teleport | awk -F'|' -v v="$version" '$2 ~ "^[[:space:]]*" v "[[:space:]]*$" && $3 ~ /https:\/\/flex0id.github.io\/teleport\/apt/ {found=1} END{exit !found}' || return 1
+    apt-cache madison teleport | awk -F'|' -v v="$version" '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if ($2==v && $3 ~ /https:\/\/flex0id[.]github[.]io\/teleport\/apt/) found=1} END{exit !found}' || return 1
     [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail 'No valid package candidate'; return 1; }
     run "Install Teleport $version" env DEBIAN_FRONTEND=noninteractive apt-get install -y "teleport=$version"
   else
     run 'Install Teleport from managed repository' dnf -y install teleport --setopt=flex0id-teleport.priority=1
   fi
+}
+time_check(){
+  if [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null || :) == yes ]]; then return 0; fi
+  say "NTP synchronization is not confirmed. Current time: $(date -Is)"
+  if yesno 'Enable system NTP?'; then timedatectl set-ntp true || :; fi
+  local n; for n in {1..5}; do [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null || :) == yes ]] && return 0; sleep 2; done
+  yesno 'Continue only if the displayed time is accurate?'
 }
 existing_guard(){
   [[ ! -e $CONF && ! -L $CONF ]] || { fail "$CONF already exists; refusing overwrite."; return 1; }
@@ -222,6 +235,7 @@ main_install(){
   fi
   [[ -z $(ss -Hlt '( sport = :443 )') ]] || { fail 'TCP 443 is already in use.'; return 1; }
   getent ahostsv4 "$CLUSTER" || { fail 'Cluster domain does not resolve.'; return 1; }
+  time_check || return 1
   yesno "Install cluster $CLUSTER with node $node?" || return 0
   install_package || return 1
   local -a args=(configure --cluster-name="$CLUSTER" --public-addr="$CLUSTER:443" --roles=auth,proxy,node -o stdout)
@@ -255,8 +269,17 @@ agent_install(){
   ask_domain 'Main cluster FQDN:'; local proxy=$ANSWER node token
   ask_name 'Node name' "$(hostname -s)"; node=$ANSWER
   curl -4fsS --max-time 15 "https://$proxy/webapi/ping" >"$TMP/ping.json" || { fail 'Trusted HTTPS to cluster unavailable.'; return 1; }
+  local cluster_version repo_version
+  cluster_version=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("server_version", ""))' <"$TMP/ping.json") || return 1
+  repo_version=$(curl -4fsSL --max-time 30 "$BASE/current-release.txt") || return 1
+  cluster_version=$(printf '%s' "$cluster_version" | sed 's/^v//')
+  repo_version=$(printf '%s' "$repo_version" | sed -E 's/^(teleport-v|v)//')
+  if [[ ! $cluster_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! $repo_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then fail 'Could not verify cluster and repository versions.'; return 1; fi
+  if [[ ${cluster_version%%.*} != ${repo_version%%.*} ]]; then fail "Cluster $cluster_version and repository $repo_version have different major versions. Align them before joining."; return 1; fi
+  say "Cluster version: $cluster_version; repository version: $repo_version"
   say 'Enter a short-lived node token generated on the main server.'
   while :; do IFS= read -r -s -p 'Join token: ' token </dev/tty || return 1; echo; [[ $token =~ ^[A-Za-z0-9_-]{16,256}$ ]] && break; say 'Invalid token, try again.'; done
+  time_check || return 1
   yesno "Join $proxy as $node?" || return 0
   install_package || return 1
   printf '%s' "$token" >"$TMP/join-token" || return 1; unset token
