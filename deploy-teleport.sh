@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-VERSION=2.1.1
+VERSION=2.2.0
 BASE=https://flex0id.github.io/teleport
 REPO_HOST=flex0id.github.io
 REPO_IPS=(185.199.108.153 185.199.109.153 185.199.110.153 185.199.111.153)
@@ -346,6 +346,7 @@ PY
   say "[OK] Cluster ready: https://$CLUSTER"
   yesno 'Create administrator now?' && admin || :
   yesno 'Create enrollment token now?' && token_menu || :
+  ssh_offer
 }
 agent_install(){
   existing_guard || return 1
@@ -390,23 +391,199 @@ PY
   printf '%s\n' agent >"$STATE/role"
   say 'Agent process is running (not yet proof of enrollment). Confirm actual enrollment on the main server with: tctl nodes ls'
   say 'No inbound SSH port has been opened.'
+  ssh_offer
 }
-cleanup(){ local rc=$?; if [[ ${DNS_PENDING:-0} == 1 ]]; then dns_restore || :; fi; [[ -z ${TMP:-} ]] || rm -rf "$TMP"; exit "$rc"; }
+# OpenSSH lockdown is opt-in, reversible, and never changes Teleport ports.
+ssh_state(){ printf '%s/openssh-backup\n' "$STATE"; }
+ssh_units(){
+  local u name
+  for u in ssh.socket sshd.socket ssh.service sshd.service; do
+    name=$(systemctl show "$u" -p Id --value 2>/dev/null) || continue
+    [[ $(systemctl show "$u" -p LoadState --value 2>/dev/null) == loaded ]] || continue
+    [[ $name =~ ^(ssh|sshd)\.(service|socket)$ ]] && printf '%s\n' "$name"
+  done | awk '!seen[$0]++'
+}
+ssh_ports(){
+  local bin
+  bin=$(command -v sshd || :) 
+  [[ -n $bin ]] || { [[ ! -x /usr/sbin/sshd ]] || bin=/usr/sbin/sshd; }
+  if [[ -n $bin ]]; then "$bin" -T 2>/dev/null | awk '$1=="port"{print $2}' || :; fi
+  # Include actual OpenSSH listeners, including systemd socket activation.
+  ss -Hltpn | awk '/"sshd"/{n=split($4,a,":");print a[n]}'
+  local u
+  for u in ssh.socket sshd.socket; do
+    [[ $(systemctl show "$u" -p LoadState --value 2>/dev/null) == loaded ]] || continue
+    systemctl show "$u" -p Listen --value | grep -oE ':[0-9]+ \(Stream\)|^[0-9]+ \(Stream\)' | grep -oE '[0-9]+' || :
+  done
+}
+ssh_restore(){
+  local backup u enabled active kind zone port scope
+  backup=$(ssh_state)
+  [[ -f $backup/units ]] || { say 'No OpenSSH changes saved by this installer.'; return 0; }
+  local failed=0
+  # Restore only rules removed by us, never reload or reset the firewall.
+  if [[ -f $backup/firewall ]]; then
+    while read -r kind zone port scope; do
+      [[ -n $kind ]] || continue
+      case "$kind" in
+        firewalld)
+          local -a opts=("--zone=$zone")
+          [[ $scope != permanent ]] || opts+=(--permanent)
+          if [[ $port == service:ssh ]]; then firewall-cmd "${opts[@]}" --add-service=ssh || failed=1
+          else firewall-cmd "${opts[@]}" --add-port="$port/tcp" || failed=1; fi;;
+        ufw) ufw delete deny in proto tcp to any port "$port" || failed=1;;
+        nft) nft delete table inet teleport_ssh_lockdown 2>/dev/null || { nft list table inet teleport_ssh_lockdown >/dev/null 2>&1 && failed=1 || :; };;
+      esac
+    done <"$backup/firewall"
+  fi
+  # Restore enablement first, then the original running state.
+  while read -r u enabled active; do
+    case "$enabled" in
+      enabled) systemctl enable "$u" || failed=1;;
+      enabled-runtime) systemctl enable --runtime "$u" || failed=1;;
+      disabled|static|indirect|generated|alias) :;;
+      *) say "Unexpected original state for $u: $enabled"; failed=1;;
+    esac
+  done <"$backup/units"
+  while read -r u enabled active; do
+    [[ $active != active ]] || systemctl start "$u" || failed=1
+  done <"$backup/units"
+  if ((failed)); then fail "Restore incomplete. Backup retained: $backup"; return 1; fi
+  rm -rf -- "$backup" || return 1
+  say '[OK] Original OpenSSH service and firewall settings restored.'
+}
+ssh_ready(){
+  systemctl is-active --quiet teleport || { fail 'Teleport is not running.'; return 1; }
+  [[ -f $STATE/role ]] || { fail 'No successful deployment recorded by this installer.'; return 1; }
+  local role; role=$(cat "$STATE/role") || return 1
+  case "$role" in
+    cluster) tctl status >/dev/null 2>&1 || { fail 'Teleport Auth Service is not healthy.'; return 1; };;
+    agent) say 'Confirm the node is registered in the cluster (tctl nodes ls).';;
+    *) fail 'Unknown deployment role.'; return 1;;
+  esac
+  say 'Test an actual NEW Teleport SSH session to this node from your workstation.'
+  say 'Keep the VNC console available. This does not disable Teleport SSH.'
+  yesno 'Confirmed working Teleport SSH login and VNC recovery?'
+}
+ssh_lockdown(){
+  local backup u enabled active port zone scope
+  backup=$(ssh_state)
+  [[ ! -e $backup ]] || { fail 'OpenSSH backup already exists. Restore first.'; return 1; }
+  ssh_ready || return 1
+  local -a units=() ports=()
+  mapfile -t units < <(ssh_units)
+  (("${#units[@]}")) || { say 'No installed OpenSSH systemd units found.'; return 0; }
+  mapfile -t ports < <(ssh_ports | awk '/^[0-9]+$/ && $1>0 && $1<=65535' | sort -nu)
+  if (("${#ports[@]}" == 0)); then fail 'Could not determine OpenSSH ports; no changes made.'; return 1; fi
+  for port in "${ports[@]}"; do
+    case "$port" in 443|3022|3023|3024|3025|3080) fail "OpenSSH port $port overlaps a Teleport port; no changes made."; return 1;; esac
+  done
+  say "OpenSSH units: ${units[*]}"
+  say "OpenSSH TCP ports: ${ports[*]}"
+  # Do not block a port shared with an unrelated listener.
+  for port in "${ports[@]}"; do
+    if ss -Hltpn "( sport = :$port )" | grep -vE '"sshd"|"systemd"' | grep -q .; then
+      fail "TCP $port has another listener; no changes made."; return 1
+    fi
+  done
+  yesno 'Disable OpenSSH and close these ports?' || return 0
+  mkdir -m 700 "$backup" || return 1
+  : >"$backup/units"; : >"$backup/firewall"
+  for u in "${units[@]}"; do
+    enabled=$(systemctl is-enabled "$u" 2>/dev/null || :)
+    active=$(systemctl is-active "$u" 2>/dev/null || :)
+    case "$enabled" in enabled|enabled-runtime|disabled|static|indirect|generated|alias) :;; *) fail "Unsupported unit state $enabled for $u"; rm -rf "$backup"; return 1;; esac
+    printf '%s %s %s\n' "$u" "$enabled" "$active" >>"$backup/units" || return 1
+  done
+  SSH_PENDING=1
+  # Stop socket units before service units to avoid reactivation.
+  for u in "${units[@]}"; do
+    systemctl stop "$u" || return 1
+    case "$(systemctl is-enabled "$u" 2>/dev/null || :)" in enabled|enabled-runtime) systemctl disable "$u" || return 1;; esac
+  done
+  # Remove firewalld SSH allowances in every active zone, runtime and permanent.
+  # Add an explicit persistent block only when using a dedicated nftables table
+  # or UFW; firewalld rich rules are managed separately below.
+  if systemctl is-active --quiet firewalld; then
+    local -a zones=()
+    mapfile -t zones < <(firewall-cmd --get-zones | tr ' ' '\n' | sed '/^$/d')
+    for zone in "${zones[@]}"; do
+      for scope in runtime permanent; do
+        local -a opts=("--zone=$zone")
+        [[ $scope != permanent ]] || opts+=(--permanent)
+        # The ssh service usually maps to port 22. Preserve unrelated services.
+        if [[ " ${ports[*]} " == *" 22 "* ]] && firewall-cmd "${opts[@]}" --query-service=ssh >/dev/null 2>&1; then
+          firewall-cmd "${opts[@]}" --remove-service=ssh || return 1
+          printf 'firewalld %s service:ssh %s\n' "$zone" "$scope" >>"$backup/firewall" || return 1
+        fi
+        for port in "${ports[@]}"; do
+          if firewall-cmd "${opts[@]}" --query-port="$port/tcp" >/dev/null 2>&1; then
+            firewall-cmd "${opts[@]}" --remove-port="$port/tcp" || return 1
+            printf 'firewalld %s %s %s\n' "$zone" "$port" "$scope" >>"$backup/firewall" || return 1
+          fi
+        done
+      done
+    done
+    say 'Removed explicit OpenSSH allowances; custom rich rules/policies remain unchanged.'
+  elif command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+    for port in "${ports[@]}"; do
+      # Do not adopt an existing deny rule that may belong to the administrator.
+      if ufw status | grep -Eq "^$port/tcp[[:space:]]+DENY[[:space:]]+IN"; then
+        say "Existing UFW deny on $port; preserved."
+        continue
+      fi
+      ufw insert 1 deny in proto tcp to any port "$port" || return 1
+      printf 'ufw - %s -\n' "$port" >>"$backup/firewall" || return 1
+    done
+  else
+    say 'No supported active firewalld/UFW detected; OpenSSH listeners are disabled.'
+    say 'Existing nftables/iptables and provider firewall remain unchanged.'
+  fi
+  for port in "${ports[@]}"; do
+    if [[ -n $(ss -Hlt "( sport = :$port )") ]]; then fail "TCP $port still listening; rolling back."; return 1; fi
+  done
+  systemctl is-active --quiet teleport || { fail 'Teleport stopped; rolling back.'; return 1; }
+  SSH_PENDING=0
+  say '[OK] OpenSSH disabled; detected SSH ports no longer listening.'
+  say 'Recovery: run this script from VNC and select menu 8, then 2.'
+}
+ssh_menu(){
+  while :; do
+    say 'OpenSSH management (Teleport remains enabled)'
+    say '1 Disable OpenSSH / close SSH ports'
+    say '2 Restore original OpenSSH settings'
+    say '3 Show OpenSSH listeners and units'
+    say '0 Back'
+    choice 'Select [0]:' 0 3
+    case "$ANSWER" in
+      0) return 0;;
+      1) ssh_lockdown || say 'OpenSSH lockdown not completed.'
+         if [[ ${SSH_PENDING:-0} == 1 ]]; then ssh_restore || :; SSH_PENDING=0; fi;;
+      2) yesno 'Restore saved OpenSSH settings?' && ssh_restore || :;;
+      3) ssh_units; ss -Hltpn || :;;
+    esac
+  done
+}
+ssh_offer(){
+  say 'Optional: disable direct OpenSSH after testing Teleport access.'
+  yesno 'Open OpenSSH management menu?' && ssh_menu || :
+}
+cleanup(){ local rc=$?; if [[ ${SSH_PENDING:-0} == 1 ]]; then ssh_restore || :; fi; if [[ ${DNS_PENDING:-0} == 1 ]]; then dns_restore || :; fi; [[ -z ${TMP:-} ]] || rm -rf "$TMP"; exit "$rc"; }
 main(){
   [[ $EUID == 0 ]] || { say 'Run as root (sudo bash tp.sh).'; exit 1; }
   [[ -r /dev/tty ]] || exit 1
   mkdir -p "$STATE"; chmod 700 "$STATE"; touch "$LOG"; chmod 600 "$LOG"
   command -v flock >/dev/null || { fail "Install util-linux first."; exit 1; }
   exec 9>/run/lock/teleport-deploy.lock; flock -n 9 || { fail 'Installer already running'; exit 1; }
-  TMP=$(mktemp -d); DNS_PENDING=0
+  TMP=$(mktemp -d); DNS_PENDING=0; SSH_PENDING=0
   trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
   detect || exit 1
   while :; do
     say ''; say "Teleport deploy $VERSION"
     say "Last repository DNS check: $REPO_DNS_MODE"
     say '1 Install main cluster'; say '2 Install SSH agent'; say '3 Configure DNS'; say '4 Restore original DNS'
-    say '5 Create administrator (main cluster)'; say '6 Generate agent token (main cluster)'; say '7 Status / repository DNS check'; say '0 Exit'
-    choice 'Select [0]:' 0 7
+    say '5 Create administrator (main cluster)'; say '6 Generate agent token (main cluster)'; say '7 Status / repository DNS check'; say '8 OpenSSH management'; say '0 Exit'
+    choice 'Select [0]:' 0 8
     case "$ANSWER" in
       0) return 0;;
       1|2|3)
@@ -418,6 +595,7 @@ main(){
       4) dns_restore || :;;
       5) admin || say 'Could not create user.';;
       6) token_menu || say 'Could not create token.';;
+      8) ssh_menu;;
       7) repo_probe || :; teleport version || :; systemctl status teleport --no-pager || :; journalctl -u teleport -n 15 --no-pager || :;;
     esac
   done
