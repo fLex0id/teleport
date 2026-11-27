@@ -2,6 +2,7 @@
 # Produce signed RPM and APT repositories from the newest approved Teleport Release.
 # Runs only in trusted GitHub Actions on the repository's default branch.
 set -Eeuo pipefail
+trap 'printf "[ERROR] build-repo.sh line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 umask 077
 
 : "${GITHUB_REPOSITORY:?missing GitHub repository}"
@@ -12,7 +13,10 @@ umask 077
 out="${1:?usage: build-repo.sh OUTPUT_DIR}"
 case "$out" in /*) ;; *) echo 'Output directory must be absolute' >&2; exit 1;; esac
 work="$(mktemp -d)"
-cleanup() { rm -rf -- "$work"; }
+cleanup() {
+    gpgconf --kill all >/dev/null 2>&1 || :
+    rm -rf -- "$work"
+}
 trap cleanup EXIT
 mkdir -p "$work/downloads" "$out"
 export GNUPGHOME="$work/gnupg"
@@ -21,16 +25,22 @@ printf '%s\n' "$TELEPORT_REPO_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
 printf '%s' "$TELEPORT_REPO_GPG_PASSPHRASE" > "$work/signing.pass"
 chmod 600 "$work/signing.pass"
 
-mapfile -t fingerprints < <(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10}')
+# Primary key fingerprints only: subkeys also have "fpr" records.
+mapfile -t fingerprints < <(gpg --batch --with-colons --list-secret-keys |
+    awk -F: '$1 == "sec" {p=1} $1 == "ssb" {p=0} $1 == "fpr" && p {print $10; p=0}')
 if (( ${#fingerprints[@]} != 1 )); then
   echo 'Expected exactly one GPG private signing key' >&2
   exit 1
 fi
 fingerprint="${fingerprints[0]}"
+expires="$(gpg --batch --with-colons --list-secret-keys "$fingerprint" | awk -F: '$1 == "sec" {print $7; exit}')"
+if [[ -n "$expires" ]] && (( expires - $(date +%s) < 60 * 86400 )); then
+  echo "::warning::Repository signing key expires on $(date -u -d "@$expires" +%F); renew it (see README)"
+fi
 
 echo 'Discovering the highest published X.Y.Z / vX.Y.Z / teleport-vX.Y.Z release ...'
 gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$work/releases.json"
-python3 - "$work/releases.json" "$work/release.env" "$work/sha256.txt" <<'PY'
+python3 -I - "$work/releases.json" "$work/release.env" "$work/sha256.txt" <<'PY'
 import json, re, sys
 from pathlib import Path
 
@@ -112,7 +122,9 @@ createrepo_c --quiet "$rpm_dir"
         -o 'APT::FTPArchive::Release::Codename=stable' \
         -o 'APT::FTPArchive::Release::Architectures=amd64' \
         -o 'APT::FTPArchive::Release::Components=main' \
-        release dists/stable > dists/stable/Release
+        release dists/stable > "$work/Release"
+    # Written outside the scanned directory so it does not list its own hash.
+    mv "$work/Release" dists/stable/Release
 )
 
 sign() {

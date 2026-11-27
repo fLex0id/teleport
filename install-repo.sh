@@ -3,11 +3,18 @@
 # Requires a fingerprint recorded independently of the remote repository.
 set -Eeuo pipefail
 umask 077
+# shellcheck disable=SC2154  # rc is assigned inside the trap
 trap 'rc=$?; printf "[ERROR] Repository setup failed at line %s (exit %s).\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
 
 [[ "$(id -u)" -eq 0 ]] || { echo 'Run this as root' >&2; exit 1; }
 base='https://flex0id.github.io/teleport'
+host="${base#https://}"
+host="${host%%/*}"
+fetch() {
+    curl -4fsSL --proto '=https' --retry 3 --connect-timeout 10 --max-time 60 "$1" -o "$2"
+}
 expected="${TELEPORT_REPO_EXPECTED_FPR:-}"
+expected="${expected//[[:space:]]/}"
 expected="${expected^^}"
 [[ "$expected" =~ ^[A-F0-9]{40}$ ]] || {
     echo 'Set TELEPORT_REPO_EXPECTED_FPR to the independently verified 40-character GPG fingerprint' >&2
@@ -70,28 +77,29 @@ echo '[OK] Repository setup prerequisites available.'
 tmp="$(mktemp -d)"
 export GNUPGHOME="$tmp/gnupg"
 mkdir -m 700 "$GNUPGHOME"
-trap 'rm -rf -- "$tmp"' EXIT
+trap 'gpgconf --kill all >/dev/null 2>&1 || :; rm -rf -- "$tmp"' EXIT
 echo '[INFO] Downloading repository signing key...'
-curl -4fsSL --retry 3 --connect-timeout 10 --max-time 60 \
-    "$base/teleport-repo.asc" -o "$tmp/key.asc"
+fetch "$base/teleport-repo.asc" "$tmp/key.asc"
 echo '[INFO] Checking signing key fingerprint...'
-gpg --batch --show-keys --with-colons "$tmp/key.asc" >"$tmp/key-info" || { echo '[ERROR] Invalid or unreadable repository signing key' >&2; exit 1; }
+gpg --batch --quiet --show-keys --with-colons "$tmp/key.asc" >"$tmp/key-info" || { echo '[ERROR] Invalid or unreadable repository signing key' >&2; exit 1; }
 actual="$(awk -F: '$1=="fpr" && !found {print toupper($10); found=1}' "$tmp/key-info")"
 [[ "$(awk -F: '$1=="pub"{n++} END{print n+0}' "$tmp/key-info")" == 1 ]] || { echo '[ERROR] Expected exactly one public signing key' >&2; exit 1; }
 [[ "$actual" == "$expected" ]] || { echo "Refusing signing-key mismatch: got $actual" >&2; exit 1; }
+# The fingerprint was checked above: trust this key in the temporary keyring.
+gpg --batch --quiet --import "$tmp/key.asc"
+printf '%s:6:\n' "$expected" | gpg --batch --quiet --import-ownertrust
+verify() { gpg --batch --quiet --verify "$@"; }
 
-if command -v dnf >/dev/null && [[ -f /etc/redhat-release ]]; then
-    [[ "$arch" == x86_64 ]] || { echo "Unsupported RPM architecture: $arch" >&2; exit 1; }
+if [[ "$pm" == dnf ]]; then
     echo '[INFO] Verifying signed RPM metadata...'
-    curl -4fsSL --retry 3 "$base/rpm/x86_64/repodata/repomd.xml" -o "$tmp/repomd.xml"
-    curl -4fsSL --retry 3 "$base/rpm/x86_64/repodata/repomd.xml.asc" -o "$tmp/repomd.xml.asc"
-    gpg --no-default-keyring --keyring "$tmp/check.gpg" --import "$tmp/key.asc" >/dev/null 2>&1
-    gpg --no-default-keyring --keyring "$tmp/check.gpg" --verify "$tmp/repomd.xml.asc" "$tmp/repomd.xml"
+    fetch "$base/rpm/x86_64/repodata/repomd.xml" "$tmp/repomd.xml"
+    fetch "$base/rpm/x86_64/repodata/repomd.xml.asc" "$tmp/repomd.xml.asc"
+    verify "$tmp/repomd.xml.asc" "$tmp/repomd.xml"
     install -D -m 0644 "$tmp/key.asc" /etc/pki/rpm-gpg/RPM-GPG-KEY-flex0id-teleport.asc
-    cat > /etc/yum.repos.d/flex0id-teleport.repo <<'REPO'
+    cat > /etc/yum.repos.d/flex0id-teleport.repo <<REPO
 [flex0id-teleport]
 name=fLex0id approved Teleport packages
-baseurl=https://flex0id.github.io/teleport/rpm/x86_64/
+baseurl=$base/rpm/x86_64/
 enabled=1
 priority=1
 includepkgs=teleport,teleport-connect
@@ -105,10 +113,14 @@ metadata_expire=1h
 REPO
     chmod 644 /etc/yum.repos.d/flex0id-teleport.repo
     # Disable vendor-specific repositories, preserving unrelated sections.
-    python3 - <<'PYRPM'
+    # -I keeps the current directory out of Python's module search path.
+    python3 -I - <<'PYRPM'
 from pathlib import Path
 import re
 import shutil
+
+hosts = ("yum.releases.teleport.dev", "rpm.releases.teleport.dev",
+         "flex0id.github.io/reverse-proxy/rpm")
 
 for path in sorted(Path("/etc/yum.repos.d").glob("*.repo")):
     if path.name == "flex0id-teleport.repo":
@@ -119,7 +131,7 @@ for path in sorted(Path("/etc/yum.repos.d").glob("*.repo")):
         if not re.match(r"^[ \t]*\[", stanza):
             continue
         urls = re.findall(r"(?mi)^[ \t]*(?:baseurl|mirrorlist|metalink)[ \t]*=[ \t]*([^\n]+)", stanza)
-        if not any("yum.releases.teleport.dev" in url or "rpm.releases.teleport.dev" in url for url in urls):
+        if not any(host in url for url in urls for host in hosts):
             continue
         if re.search(r"(?mi)^[ \t]*enabled[ \t]*=", stanza):
             stanza = re.sub(r"(?mi)^[ \t]*enabled[ \t]*=[^\n]*", "enabled=0", stanza)
@@ -137,19 +149,17 @@ PYRPM
     echo 'DNF repository installed. Verification:'
     dnf -y makecache --refresh --disablerepo='*' --enablerepo='flex0id-teleport'
     dnf repoquery --disablerepo='*' --enablerepo='flex0id-teleport' --available teleport teleport-connect || true
-elif command -v apt-get >/dev/null && [[ -f /etc/debian_version ]]; then
-    [[ "$arch" == x86_64 ]] || { echo "Unsupported APT architecture: $arch" >&2; exit 1; }
+else
     echo '[INFO] Verifying signed APT metadata...'
-    curl -4fsSL --retry 3 "$base/apt/dists/stable/InRelease" -o "$tmp/InRelease"
-    gpg --no-default-keyring --keyring "$tmp/check.gpg" --import "$tmp/key.asc" >/dev/null 2>&1
-    gpg --no-default-keyring --keyring "$tmp/check.gpg" --verify "$tmp/InRelease"
+    fetch "$base/apt/dists/stable/InRelease" "$tmp/InRelease"
+    verify "$tmp/InRelease"
     install -D -m 0644 "$tmp/key.asc" /etc/apt/keyrings/flex0id-teleport.asc
-    cat > /etc/apt/sources.list.d/flex0id-teleport.list <<'REPO'
-deb [arch=amd64 signed-by=/etc/apt/keyrings/flex0id-teleport.asc] https://flex0id.github.io/teleport/apt stable main
+    cat > /etc/apt/sources.list.d/flex0id-teleport.list <<REPO
+deb [arch=amd64 signed-by=/etc/apt/keyrings/flex0id-teleport.asc] $base/apt stable main
 REPO
-    cat > /etc/apt/preferences.d/flex0id-teleport <<'PIN'
+    cat > /etc/apt/preferences.d/flex0id-teleport <<PIN
 Package: teleport teleport-connect
-Pin: origin "flex0id.github.io"
+Pin: origin "$host"
 Pin-Priority: 700
 
 Package: teleport teleport-connect
@@ -162,11 +172,7 @@ PIN
     # an identical version. Disable the official vendor's Teleport repository
     # if present, preserving a backup of every changed sources file.
     # Do not alter unrelated repositories or mixed-URI deb822 stanzas.
-    command -v python3 >/dev/null || {
-        echo 'python3 is required to disable competing Teleport APT sources safely' >&2
-        exit 1
-    }
-    python3 - <<'PY'
+    python3 -I - <<'PY'
 from pathlib import Path
 import re
 import shutil
@@ -228,11 +234,11 @@ for path, updated in edits:
     print(f"Disabled competing official Teleport APT source: {path}")
 PY
     echo 'APT repository installed. Verification:'
-    apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any update
+    # Refresh only this source: unrelated broken repositories must not fail setup.
+    apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any \
+        -o Dir::Etc::sourcelist=sources.list.d/flex0id-teleport.list \
+        -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 update
     apt-cache policy teleport teleport-connect
-else
-    echo 'Unsupported Linux distribution or package manager' >&2
-    exit 1
 fi
 
 echo 'Existing Teleport services and configurations are untouched; package updates use normal dnf/apt commands.'

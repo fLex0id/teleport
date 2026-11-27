@@ -22,7 +22,7 @@
 На чистом Linux x86_64 с systemd запустите от root:
 
 ~~~bash
-curl -4fLO https://flex0id.github.io/teleport/tp.sh
+curl -4fLO https://flex0id.github.io/teleport/tp.sh &&
 bash tp.sh
 ~~~
 
@@ -41,7 +41,7 @@ bash tp.sh
 Если DNS не работает ещё до скачивания самого скрипта, сначала попробуйте штатную команду выше. Только при ошибке разрешения имени используйте:
 
 ~~~bash
-curl -4fLO --resolve flex0id.github.io:443:185.199.108.153 https://flex0id.github.io/teleport/tp.sh
+curl -4fLO --resolve flex0id.github.io:443:185.199.108.153 https://flex0id.github.io/teleport/tp.sh &&
 bash tp.sh
 ~~~
 
@@ -54,14 +54,17 @@ bash tp.sh
 Скачайте установщик и запустите его с указанным отпечатком публичного ключа.
 
 ~~~bash
-curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh -o /tmp/install-teleport-repo.sh
-sudo env TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash /tmp/install-teleport-repo.sh
+f=$(mktemp) &&
+curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh -o "$f" &&
+sudo env TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash "$f"
 ~~~
 
-Если вы уже работаете под root, используйте вместо последней команды:
+Если вы уже работаете под root, используйте вместо этих команд:
 
 ~~~bash
-TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash /tmp/install-teleport-repo.sh
+f=$(mktemp) &&
+curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh -o "$f" &&
+TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash "$f"
 ~~~
 
 Установщик определяет пакетный менеджер, проверяет отпечаток публичного ключа и подпись метаданных, подключает репозиторий, отключает обнаруженные стандартные официальные источники Teleport с сохранением резервных копий их изменённых конфигураций и обновляет метаданные. Установка или обновление пакета и перезапуск службы при этом не выполняются.
@@ -120,6 +123,20 @@ sudo apt install --only-upgrade -y teleport-connect
 
 > Перед обновлением основных версий ознакомьтесь с требованиями производителя, сделайте резервную копию и соблюдайте порядок обновления компонентов кластера. Установка пакета не гарантирует перезапуск уже работающей службы.
 
+### Закрепление версии на узлах кластера
+
+Репозиторий содержит только последнюю версию, поэтому общее обновление системы может перескочить через мажорную версию Teleport или обновить агент раньше Proxy. Чтобы этого не случилось, закрепите пакет:
+
+~~~bash
+# Ubuntu / Debian
+sudo apt-mark hold teleport
+# Rocky Linux
+sudo dnf install -y 'dnf-command(versionlock)'
+sudo dnf versionlock add teleport
+~~~
+
+Перед плановым обновлением снимите закрепление (`apt-mark unhold teleport` или `dnf versionlock delete teleport`), проверьте, что опубликованная версия подходит по [правилам обновления](https://goteleport.com/docs/upgrading/overview/), и после обновления закрепите пакет снова.
+
 ## 4. Проверка и диагностика
 
 **Rocky Linux**
@@ -153,6 +170,17 @@ systemctl status teleport --no-pager
 | Fingerprint | [signing-fingerprint.txt](https://flex0id.github.io/teleport/signing-fingerprint.txt) |
 
 APT проверяет подписанные метаданные InRelease. DNF проверяет подпись метаданных через repo_gpgcheck=1; отдельные RPM не переподписываются (gpgcheck=0), их контрольные суммы защищены подписанными метаданными. При ошибке подписи не отключайте проверку GPG.
+
+### Продление ключа подписи
+
+Ключ создаётся на 2 года. Дату окончания показывает `gpg --homedir ~/.gnupg-teleport-repo -K`. Продлите ключ заранее:
+
+1. `gpg --homedir ~/.gnupg-teleport-repo --quick-set-expire <отпечаток> 2y`
+2. Снова запустите `setup-publisher.sh`.
+3. Запустите workflow публикации репозитория.
+4. Повторите подключение репозитория (раздел 1) на каждом клиенте. Если DNF всё ещё сообщает об истёкшем ключе, выполните `sudo dnf clean all`.
+
+Отпечаток ключа при продлении не меняется.
 
 ## 5. Лицензирование
 
