@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# Package-managed Teleport deployment, Linux x86_64, systemd.
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+VERSION=2.0.0
+BASE=https://flex0id.github.io/teleport
+FPR=95AB1A0D022288C96B135E395D6220FDB9C74356
+CONF=/etc/teleport.yaml
+STATE=/var/lib/teleport-deploy
+LOG=/var/log/teleport-deploy.log
+DNSUNIT=teleport-doh.service
+DNSCONF=/etc/teleport-doh.toml
+DNSBACK=$STATE/dns-original
+NMCONF=/etc/NetworkManager/conf.d/95-teleport-deploy-dns.conf
+say(){ printf '%s\n' "$*"; }
+fail(){ say "[ERROR] $*" >&2; return 1; }
+ask(){ local v; IFS= read -r -p "$1 " v </dev/tty || exit 130; ANSWER=$v; }
+yesno(){ while :; do ask "$1 [y/N]"; case "$ANSWER" in y|Y|yes|YES) return 0;; ''|n|N|no|NO) return 1;; *) say 'Enter y or n.';; esac; done; }
+choice(){ while :; do ask "$1"; case "$ANSWER" in '') ANSWER=$2;; esac; if [[ $ANSWER =~ ^[0-9]$ ]] && (( ANSWER <= $3 )); then return; fi; say 'Invalid choice. Try again.'; done; }
+domain_ok(){ [[ $1 =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ && $(printf %s "$1" | wc -c) -le 253 ]]; }
+ip_ok(){ local a b c d x; [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; IFS=. read -r a b c d <<<"$1"; for x in "$a" "$b" "$c" "$d"; do (( 10#$x <= 255 )) || return 1; done; }
+ask_domain(){ while :; do ask "$1"; if domain_ok "$ANSWER"; then return; fi; say 'Enter a valid FQDN, without https:// or port.'; done; }
+ask_name(){ while :; do ask "$1 [$2]"; ANSWER=${ANSWER:-$2}; [[ $ANSWER =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$ ]] && return; say 'Use ASCII letters, digits, dots, hyphens or underscores.'; done; }
+run(){ local desc=$1; shift; say "$desc ..."; if "$@" >>"$LOG" 2>&1; then say '[OK]'; else say "[ERROR] See $LOG"; tail -n 12 "$LOG" >&2; return 1; fi; }
+fetch(){ curl -4fsSL --retry 3 --connect-timeout 15 --max-time 120 "$1" -o "$2"; }
+detect(){
+  [[ $(uname -m) == x86_64 ]] || { fail 'Only x86_64 / amd64 packages are published.'; return 1; }
+  [[ -d /run/systemd/system ]] || { fail 'systemd is required.'; return 1; }
+  [[ -r /etc/os-release ]] || return 1
+  . /etc/os-release
+  case "$ID" in ubuntu|debian) PM=apt;; rocky|almalinux|rhel|centos) PM=dnf;; *) fail "Unsupported distribution: $ID"; return 1;; esac
+  command -v "$PM" >/dev/null || return 1
+  say "OS: ${PRETTY_NAME:-$ID} ($PM)"
+}
+deps(){
+  if [[ $PM == apt ]]; then
+    run 'Refresh APT' apt-get -o DPkg::Lock::Timeout=120 update &&
+    run 'Install prerequisites' env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates curl gnupg python3 iproute2 openssl util-linux dnsutils
+  else
+    run 'Install prerequisites' dnf -y install ca-certificates curl gnupg2 python3 iproute openssl util-linux bind-utils
+  fi
+}
+dns_test(){ local h; for h in github.com raw.githubusercontent.com flex0id.github.io; do timeout 10 getent ahostsv4 "$h" >/dev/null || return 1; done; }
+dns_restore(){
+  [[ -d $DNSBACK ]] || { say 'No saved DNS configuration.'; return 0; }
+  cp -a "$DNSBACK/resolv.conf" /etc/.teleport-resolv-restore.$$ || return 1
+  mv -Tf /etc/.teleport-resolv-restore.$$ /etc/resolv.conf || return 1
+  rm -f "$NMCONF"
+  if [[ -f $DNSBACK/nm ]]; then systemctl reload NetworkManager || say 'Check NetworkManager manually.'; fi
+  systemctl disable --now "$DNSUNIT" >/dev/null 2>&1 || :
+  rm -f "/etc/systemd/system/$DNSUNIT" "$DNSCONF"
+  systemctl daemon-reload
+  if dns_test; then rm -rf "$DNSBACK"; say '[OK] Original DNS restored.'; else fail "Original DNS restored but resolution failed; backup: $DNSBACK"; fi
+}
+dns_stamp(){
+  python3 - "$@" <<'PY'
+import base64,struct,sys
+ip,host,path=sys.argv[1:]
+def lp(s):
+    b=s.encode('ascii')
+    if len(b)>255: raise ValueError('field too long')
+    return bytes([len(b)])+b
+raw=b'\x02'+struct.pack('<Q',0)+lp(ip)+b'\x00'+lp(host)+lp(path)
+print('sdns://'+base64.urlsafe_b64encode(raw).decode().rstrip('='))
+PY
+}
+dns_change(){
+  [[ ! -e $DNSBACK ]] || { say 'Restore previous DNS configuration first (menu 4).'; return 1; }
+  say '1 Quad9   2 Cloudflare   3 Google   4 Cisco OpenDNS'
+  say '5 NextDNS (DoH profile)   6 AdGuard   7 Custom UDP   0 Keep current'
+  choice 'DNS provider [0]:' 0 7
+  local p=$ANSWER ips host path=/dns-query mode ip stamp names='' i=0 bin default_route
+  case "$p" in
+    0) return 0;;
+    1) ips='9.9.9.9 149.112.112.112'; host=dns.quad9.net;;
+    2) ips='1.1.1.1 1.0.0.1'; host=cloudflare-dns.com;;
+    3) ips='8.8.8.8 8.8.4.4'; host=dns.google;;
+    4) ips='208.67.222.222 208.67.220.220'; host=doh.opendns.com;;
+    5) ips='45.90.28.0 45.90.30.0'; host=dns.nextdns.io;;
+    6) ips='94.140.14.14 94.140.15.15'; host=dns.adguard-dns.com;;
+    7) while :; do ask 'One or two IPv4 addresses, separated by space:'; ips=$ANSWER; local valid=1 count=0; for ip in $ips; do ip_ok "$ip" || valid=0; count=$((count+1)); done; ((valid && count>=1 && count<=2)) && break; say 'Invalid addresses.'; done; host='';;
+  esac
+  if [[ $p == 5 ]]; then
+    mode=2
+    while :; do ask 'NextDNS profile ID (6 hex characters):'; [[ $ANSWER =~ ^[a-fA-F0-9]{6}$ ]] && break; say 'Invalid profile ID.'; done
+    path="/$ANSWER"
+  elif [[ $p == 7 ]]; then mode=1
+  else choice '1 UDP DNS, 2 DNS over HTTPS, 0 Cancel [1]:' 1 2; mode=$ANSWER; fi
+  [[ $mode != 0 ]] || return 0
+  say 'This changes system-wide DNS and may affect private DNS names.'
+  yesno 'Apply DNS configuration?' || return 0
+  [[ ! -e $NMCONF && ! -e $DNSCONF && ! -e /etc/systemd/system/$DNSUNIT ]] || { fail 'Existing resolver configuration; refusing overwrite.'; return 1; }
+  if [[ $mode == 2 ]]; then
+    if ! command -v dnscrypt-proxy >/dev/null; then
+      if [[ $PM == apt ]]; then run 'Install DNSCrypt proxy' apt-get install -y dnscrypt-proxy || return 1
+      else run 'Install DNSCrypt proxy (requires an enabled trusted repository, e.g. EPEL)' dnf -y install dnscrypt-proxy || { say 'DoH unavailable; current system DNS unchanged.'; return 1; }; fi
+    fi
+    bin=$(command -v dnscrypt-proxy) || return 1
+  fi
+  mkdir -m 700 "$DNSBACK" || return 1
+  cp -a /etc/resolv.conf "$DNSBACK/resolv.conf" || { rmdir "$DNSBACK"; return 1; }
+  DNS_PENDING=1
+  if [[ $mode == 2 ]]; then
+    # Use the explicit endpoint IPs, no unencrypted bootstrap fallback.
+    {
+      say "listen_addresses = ['127.0.2.1:53']"
+      say 'ipv4_servers = true'; say 'ipv6_servers = false'
+      say 'dnscrypt_servers = false'; say 'doh_servers = true'; say 'odoh_servers = false'
+      say 'ignore_system_dns = true'; say 'timeout = 5000'; say 'cache = true'
+      for ip in $ips; do i=$((i+1)); names="${names:+$names, }'up$i'"; done
+      say "server_names = [$names]"
+      say '[static]'
+      i=0; for ip in $ips; do i=$((i+1)); stamp=$(dns_stamp "$ip" "$host" "$path") || return 1; say "[static.up$i]"; say "stamp = '$stamp'"; done
+    } >"$DNSCONF"
+    run 'Check DoH configuration' "$bin" -config "$DNSCONF" -check || { dns_restore || :; DNS_PENDING=0; return 1; }
+    cat >"/etc/systemd/system/$DNSUNIT" <<EOF
+[Unit]
+Description=Local Teleport deployment DoH resolver
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=$bin -config $DNSCONF
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload || return 1
+    run 'Start local DoH' systemctl enable --now "$DNSUNIT" || { dns_restore || :; DNS_PENDING=0; return 1; }
+    local ready=0 n
+    for n in {1..10}; do if dig @127.0.2.1 github.com A +time=2 +tries=1 +short | grep -Eq '^[0-9]+\.'; then ready=1; break; fi; sleep 1; done
+    ((ready)) || { fail 'DoH lookup failed'; dns_restore || :; DNS_PENDING=0; return 1; }
+    ips=127.0.2.1
+  else
+    local ready=0
+    for ip in $ips; do if dig @"$ip" github.com A +time=3 +tries=1 +short | grep -Eq '^[0-9]+\.'; then ready=1; break; fi; done
+    ((ready)) || { fail 'UDP DNS unavailable'; dns_restore || :; DNS_PENDING=0; return 1; }
+  fi
+  if systemctl is-active --quiet NetworkManager; then
+    touch "$DNSBACK/nm"
+    mkdir -p /etc/NetworkManager/conf.d
+    printf '[main]\ndns=none\n' >"$NMCONF"
+    systemctl reload NetworkManager || return 1
+  fi
+  # Detach from systemd-resolved stub; do not stop other network services.
+  local tmp; tmp=$(mktemp /etc/.teleport-resolv.XXXXXX)
+  { say '# Managed by deploy-teleport.sh'; for ip in $ips; do say "nameserver $ip"; done; say 'options timeout:2 attempts:2'; } >"$tmp"
+  chmod 644 "$tmp"; mv -Tf "$tmp" /etc/resolv.conf
+  if command -v restorecon >/dev/null; then restorecon /etc/resolv.conf || :; fi
+  if dns_test; then DNS_PENDING=0; say '[OK] DNS configured. Use menu 4 to restore.'; else dns_restore || :; DNS_PENDING=0; return 1; fi
+}
+install_package(){
+  fetch https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh "$TMP/install-repo.sh" || return 1
+  run 'Configure signed Teleport repository' env TELEPORT_REPO_EXPECTED_FPR="$FPR" bash "$TMP/install-repo.sh" || return 1
+  if [[ $PM == apt ]]; then
+    local version; version=$(apt-cache policy teleport | awk '/Candidate:/{print $2}')
+    [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail 'No valid package candidate'; return 1; }
+    run "Install Teleport $version" env DEBIAN_FRONTEND=noninteractive apt-get install -y "teleport=$version"
+  else
+    run 'Install Teleport from managed repository' dnf -y install teleport --setopt=flex0id-teleport.priority=1
+  fi
+}
+existing_guard(){
+  [[ ! -e $CONF && ! -L $CONF ]] || { fail "$CONF already exists; refusing overwrite."; return 1; }
+  if [[ -d /var/lib/teleport && -n $(ls -A /var/lib/teleport) ]]; then fail 'Existing Teleport data; refusing overwrite.'; return 1; fi
+  if command -v teleport >/dev/null || systemctl cat teleport.service >/dev/null 2>&1; then fail 'Existing Teleport installation; use normal package updates or manual recovery.'; return 1; fi
+}
+open_https(){
+  if systemctl is-active --quiet firewalld; then
+    local iface zone
+    iface=$(ip -4 route show default | awk 'NR==1{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+    zone=$(firewall-cmd --get-zone-of-interface="$iface" 2>/dev/null || firewall-cmd --get-default-zone)
+    run 'Allow HTTPS in active firewall zone' firewall-cmd --zone="$zone" --add-service=https &&
+    run 'Persist HTTPS firewall rule' firewall-cmd --permanent --zone="$zone" --add-service=https
+  elif command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+    run 'Allow HTTPS in UFW' ufw allow 443/tcp
+  else say 'Ensure TCP 443 is allowed by host/provider firewall.'; fi
+}
+wait_cluster(){
+  local n
+  for n in {1..45}; do
+    if systemctl is-active --quiet teleport && tctl status >/dev/null 2>&1 &&
+      curl -4fsS --max-time 5 --resolve "$CLUSTER:443:127.0.0.1" "https://$CLUSTER/webapi/ping" >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  fail 'Cluster not healthy or trusted HTTPS not ready. Check journalctl -u teleport.'
+}
+admin(){
+  local u login
+  ask_name 'Teleport administrator' admin; u=$ANSWER
+  while :; do ask 'Existing Linux login [root]:'; login=${ANSWER:-root}; if [[ $login =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] && id "$login" >/dev/null 2>&1; then break; fi; say 'Enter an existing local account.'; done
+  # The invitation URL is displayed only in the console, not in the log.
+  tctl users add "$u" --roles=editor,access --logins="$login"
+}
+token_menu(){
+  say 'One-hour node enrollment token. Keep it private.'
+  tctl tokens add --type=node --ttl=1h --format=text
+}
+main_install(){
+  existing_guard || return 1
+  ask_domain 'Cluster FQDN (public DNS points to this host):'; CLUSTER=$ANSWER
+  ask_name 'Node name' "$(hostname -s)"; local node=$ANSWER email cert key mode
+  choice 'TLS: 1 built-in ACME, 2 existing trusted certificate, 0 Cancel [1]:' 1 2; mode=$ANSWER
+  [[ $mode != 0 ]] || return 0
+  if [[ $mode == 1 ]]; then
+    while :; do ask 'ACME email:'; [[ $ANSWER =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] && { email=$ANSWER; break; }; say 'Invalid email.'; done
+  else
+    while :; do ask 'Absolute fullchain PEM path:'; cert=$ANSWER; [[ $cert == /* && -r $cert ]] && break; say 'File not readable.'; done
+    while :; do ask 'Absolute private key PEM path:'; key=$ANSWER; [[ $key == /* && -r $key ]] && break; say 'File not readable.'; done
+    openssl x509 -in "$cert" -noout -checkhost "$CLUSTER" || return 1
+  fi
+  [[ -z $(ss -Hlt '( sport = :443 )') ]] || { fail 'TCP 443 is already in use.'; return 1; }
+  getent ahostsv4 "$CLUSTER" || { fail 'Cluster domain does not resolve.'; return 1; }
+  yesno "Install cluster $CLUSTER with node $node?" || return 0
+  install_package || return 1
+  local -a args=(configure --cluster-name="$CLUSTER" --public-addr="$CLUSTER:443" --roles=auth,proxy,node -o stdout)
+  if [[ $mode == 1 ]]; then args+=(--acme --acme-email="$email"); else args+=(--cert-file="$cert" --key-file="$key"); fi
+  teleport "${args[@]}" >"$TMP/cluster.yaml" || return 1
+  # Use PyYAML from the distribution to edit structured configuration.
+  python3 - "$TMP/cluster.yaml" "$node" <<'PY'
+import sys,yaml
+p,node=sys.argv[1:]
+with open(p) as f: c=yaml.safe_load(f)
+c.setdefault('teleport',{})['nodename']=node
+c.setdefault('auth_service',{})['listen_addr']='127.0.0.1:3025'
+c['auth_service']['proxy_listener_mode']='multiplex'
+c.setdefault('ssh_service',{})['listen_addr']='127.0.0.1:3022'
+with open(p,'w') as f: yaml.safe_dump(c,f,sort_keys=False)
+PY
+  [[ ! -e $CONF ]] || { fail 'Package created a configuration; inspect manually.'; return 1; }
+  install -m 0600 "$TMP/cluster.yaml" "$CONF"
+  if command -v restorecon >/dev/null; then restorecon "$CONF" || :; fi
+  open_https || return 1
+  run 'Enable Teleport' systemctl enable --now teleport || return 1
+  wait_cluster || return 1
+  printf '%s\n' cluster >"$STATE/role"
+  say "[OK] Cluster ready: https://$CLUSTER"
+  yesno 'Create administrator now?' && admin || :
+  yesno 'Create enrollment token now?' && token_menu || :
+}
+agent_install(){
+  existing_guard || return 1
+  ask_domain 'Main cluster FQDN:'; local proxy=$ANSWER node token
+  ask_name 'Node name' "$(hostname -s)"; node=$ANSWER
+  curl -4fsS --max-time 15 "https://$proxy/webapi/ping" >"$TMP/ping.json" || { fail 'Trusted HTTPS to cluster unavailable.'; return 1; }
+  say 'Enter a short-lived node token generated on the main server.'
+  while :; do IFS= read -r -s -p 'Join token: ' token </dev/tty || return 1; echo; [[ $token =~ ^[A-Za-z0-9_-]{16,256}$ ]] && break; say 'Invalid token, try again.'; done
+  yesno "Join $proxy as $node?" || return 0
+  install_package || return 1
+  printf '%s' "$token" >"$TMP/join-token"; unset token
+  install -d -m 0700 /etc/teleport
+  [[ ! -e /etc/teleport/join-token ]] || return 1
+  install -m 0600 "$TMP/join-token" /etc/teleport/join-token
+  rm -f "$TMP/join-token"
+  teleport node configure --output="file://$TMP/agent.yaml" --proxy="$proxy:443" --token=/etc/teleport/join-token >/dev/null || return 1
+  python3 - "$TMP/agent.yaml" "$node" <<'PY'
+import sys,yaml
+p,node=sys.argv[1:]
+with open(p) as f:c=yaml.safe_load(f)
+c.setdefault('teleport',{})['nodename']=node
+with open(p,'w') as f:yaml.safe_dump(c,f,sort_keys=False)
+PY
+  [[ ! -e $CONF ]] || return 1
+  install -m 0600 "$TMP/agent.yaml" "$CONF"
+  if command -v restorecon >/dev/null; then restorecon "$CONF" /etc/teleport/join-token || :; fi
+  run 'Enable Teleport agent' systemctl enable --now teleport || return 1
+  sleep 5
+  systemctl is-active --quiet teleport || { fail 'Agent not running; inspect journalctl -u teleport.'; return 1; }
+  printf '%s\n' agent >"$STATE/role"
+  say 'Agent process is running. Confirm actual enrollment on the main server with: tctl nodes ls'
+  say 'No inbound SSH port has been opened.'
+}
+cleanup(){ local rc=$?; if [[ ${DNS_PENDING:-0} == 1 ]]; then dns_restore || :; fi; [[ -z ${TMP:-} ]] || rm -rf "$TMP"; exit "$rc"; }
+main(){
+  [[ $EUID == 0 ]] || { say 'Run as root (sudo bash tp.sh).'; exit 1; }
+  [[ -r /dev/tty ]] || exit 1
+  mkdir -p "$STATE"; chmod 700 "$STATE"; touch "$LOG"; chmod 600 "$LOG"
+  exec 9>/run/lock/teleport-deploy.lock; flock -n 9 || { fail 'Installer already running'; exit 1; }
+  TMP=$(mktemp -d); DNS_PENDING=0
+  trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  detect || exit 1
+  while :; do
+    say ''; say "Teleport deploy $VERSION"
+    say '1 Install main cluster'; say '2 Install SSH agent'; say '3 Configure DNS'; say '4 Restore original DNS'
+    say '5 Create administrator (main cluster)'; say '6 Generate agent token (main cluster)'; say '7 Status'; say '0 Exit'
+    choice 'Select [0]:' 0 7
+    case "$ANSWER" in
+      0) return 0;;
+      1|2|3)
+        local action=$ANSWER
+        if deps; then
+          if [[ $PM == apt ]]; then run 'Install YAML support' apt-get install -y python3-yaml || continue; else run 'Install YAML support' dnf -y install python3-pyyaml || continue; fi
+          case "$action" in 1) main_install || say 'Installation stopped; inspect log before retrying.';; 2) agent_install || say 'Installation stopped; inspect log before retrying.';; 3) dns_change || say 'DNS change unsuccessful.'; if ((DNS_PENDING)); then dns_restore || :; DNS_PENDING=0; fi;; esac
+        fi;;
+      4) dns_restore || :;;
+      5) admin || say 'Could not create user.';;
+      6) token_menu || say 'Could not create token.';;
+      7) teleport version || :; systemctl status teleport --no-pager || :; journalctl -u teleport -n 15 --no-pager || :;;
+    esac
+  done
+}
+[[ ${BASH_SOURCE[0]} != "$0" ]] || main "$@"
