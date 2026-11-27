@@ -129,12 +129,15 @@ gpg --armor --export "$fingerprint" > "$out/teleport-repo.asc"
 printf '%s\n' "$fingerprint" > "$out/signing-fingerprint.txt"
 printf '%s\n' "$tag" > "$out/current-release.txt"
 install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/LICENSE-TELEPORT" "$out/LICENSE-TELEPORT"
+bash -n "$(dirname "${BASH_SOURCE[0]}")/deploy-teleport.sh"
+install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/deploy-teleport.sh" "$out/tp.sh"
 touch "$out/.nojekyll"
 cat > "$out/index.html" <<HTML
 <!doctype html><html lang="en"><meta charset="utf-8"><title>Teleport packages</title>
 <h1>fLex0id Teleport package repository</h1>
 <p>Currently published release: <strong>${tag}</strong></p>
 <p>Teleport Server and Teleport Connect are indexed for Linux x86_64 / amd64.</p>
+<p><a href="tp.sh">Interactive deployment script (tp.sh)</a>.</p>
 <p>Signed metadata: <a href="apt/dists/stable/InRelease">APT InRelease</a>,
 <a href="rpm/x86_64/repodata/repomd.xml">RPM repomd.xml</a>.</p>
 <p><a href="teleport-repo.asc">Public signing key</a> and
