@@ -1,0 +1,22 @@
+name: Validate Teleport deployment script
+on:
+  push:
+    paths:
+      - deploy-teleport.sh
+      - tests/deploy-test.sh
+      - .github/workflows/deploy-tests.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n deploy-teleport.sh && bash -n tests/deploy-test.sh
+      - run: shellcheck --severity=error deploy-teleport.sh tests/deploy-test.sh
+  behavior:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/deploy-test.sh
