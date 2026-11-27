@@ -8,9 +8,9 @@ trap 'rm -rf "$scratch"' EXIT
 LOG=$scratch/log
 # Isolate UFW persistent files and ensure no host network rules are modified.
 cp -a /etc/ufw "$scratch/ufw"
-cp -a /etc/default/ufw "$scratch/default-ufw"
+cp -a /etc/default "$scratch/default"
 mount --bind "$scratch/ufw" /etc/ufw
-mount --bind "$scratch/default-ufw" /etc/default/ufw
+mount --bind "$scratch/default" /etc/default
 ip link set lo up
 ufw --force reset
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
@@ -19,7 +19,7 @@ cat > /etc/ufw/applications.d/teleport-test-openssh <<'APP'
 [TeleportTestSSH]
 title=OpenSSH test
 description=SSH test
-ports=22/tcp
+ports=2222/tcp
 APP
 ufw allow 22/tcp comment 'SSH'
 ufw allow from 192.0.2.10 to any port 22 proto tcp
@@ -27,9 +27,9 @@ ufw allow TeleportTestSSH
 ufw --force enable
 ufw status numbered >"$scratch/before-status"
 mkdir "$scratch/backup"
-ufw_lockdown "$scratch/backup" 22
-ufw_verify_chain iptables ufw-before-input 22
-if ufw_ipv6; then ufw_verify_chain ip6tables ufw6-before-input 22; fi
+ufw_lockdown "$scratch/backup" 22 2222
+ufw_verify_chain iptables ufw-before-input 22 2222
+if ufw_ipv6; then ufw_verify_chain ip6tables ufw6-before-input 22 2222; fi
 ufw status numbered >"$scratch/locked-status"
 cmp "$scratch/before-status" "$scratch/locked-status"
 echo 'PASS actual UFW: comments, profile and source-specific allowances preserved and overridden'
