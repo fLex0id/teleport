@@ -14,7 +14,6 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'teleport-v')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
