@@ -1,148 +1,124 @@
-# Teleport — репозиторий обновлений для Linux
+# Teleport — репозиторий пакетов для Linux
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Architecture](https://img.shields.io/badge/architecture-x86__64-blue) ![Packages](https://img.shields.io/badge/packages-RPM%20%7C%20DEB-blue)
 
-Независимый репозиторий официальных пакетов Teleport с управляемой публикацией версий и GPG-подписью метаданных. Предназначен для Rocky Linux, Ubuntu и Debian (x86_64 / amd64). Не является официальным репозиторием производителя.
+Независимый репозиторий оригинальных пакетов Teleport с поддержкой штатной установки и обновления через APT и DNF. Метаданные репозитория защищены GPG-подписью.
 
-**Релизы:** [GitHub Releases](https://github.com/fLex0id/teleport/releases) · **Публикация:** [GitHub Actions](https://github.com/fLex0id/teleport/actions) · **Пакеты:** [GitHub Pages](https://flex0id.github.io/teleport/)
+**[Релизы](https://github.com/fLex0id/teleport/releases)** · **[Текущая версия](https://flex0id.github.io/teleport/current-release.txt)** · **[Репозиторий пакетов](https://flex0id.github.io/teleport/)**
 
-## 1. Подключение Linux-сервера
+## Поддерживаемые платформы
 
-Выполняется один раз на каждом сервере, в том числе при переходе со старого репозитория reverse-proxy. Требуются Bash, curl, GnuPG, Python 3, права root и уже опубликованные подписанные метаданные.
+| Дистрибутив | Архитектура | Пакетный менеджер |
+|---|---|---|
+| Rocky Linux | x86_64 | DNF |
+| Ubuntu / Debian | amd64 | APT |
 
-Подключайтесь через независимый SSH-канал. Сначала скачайте и проверьте скрипт, затем укажите ранее проверенный 40-символьный fingerprint ключа подписи (вывод setup-publisher.sh или сохранённый доверенный ключ).
+## 1. Подключение репозитория
+
+Выполните один раз на каждом Linux-сервере. Требуются Bash, curl, GnuPG, Python 3 и права администратора.
+
+Скачайте установщик, ознакомьтесь с его содержимым и запустите с указанным отпечатком публичного ключа.
 
 ~~~bash
 curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh -o /tmp/install-teleport-repo.sh
 less /tmp/install-teleport-repo.sh
-sudo env TELEPORT_REPO_EXPECTED_FPR='YOUR_VERIFIED_40_HEX_FINGERPRINT' bash /tmp/install-teleport-repo.sh
+sudo env TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash /tmp/install-teleport-repo.sh
 ~~~
 
-Если вы уже root, sudo не требуется.
-
-Установщик определяет пакетный менеджер, проверяет fingerprint и GPG-подпись метаданных, настраивает постоянный источник пакетов, отключает обнаруженные официальные источники Teleport и обновляет метаданные. Службы Teleport не перезапускаются, пакеты не обновляются.
-
-### Приоритет источников
-
-| Linux | Конфигурация | Политика |
-|---|---|---|
-| Rocky Linux | /etc/yum.repos.d/flex0id-teleport.repo | priority=1; includepkgs=teleport; repo_gpgcheck=1 |
-| Ubuntu / Debian | /etc/apt/sources.list.d/flex0id-teleport.list | signed-by; APT pin priority=700 для flex0id.github.io |
-
-Официальные источники отключаются с сохранением резервных копий изменённых файлов (.before-flex0id-teleport.bak). Старый стандартный файл flex0id-teleport заменяется новым. Нестандартные зеркала и дополнительные источники необходимо проверить вручную. APT pinning по имени хоста не различает разные пути одного GitHub Pages домена, поэтому дублирующие источники должны быть отключены.
-
-Проверка Rocky Linux:
+Если вы уже работаете под root, используйте вместо последней команды:
 
 ~~~bash
-dnf repolist --enabled
-dnf --refresh repoquery --available teleport
+TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash /tmp/install-teleport-repo.sh
 ~~~
 
-Проверка Ubuntu / Debian:
+Установщик определяет пакетный менеджер, проверяет отпечаток публичного ключа и подпись метаданных, подключает репозиторий, отключает обнаруженные стандартные официальные источники Teleport с сохранением резервных копий их изменённых конфигураций и обновляет метаданные. Установка или обновление пакета и перезапуск службы при этом не выполняются.
 
-~~~bash
-apt-cache policy teleport
-~~~
+Подключая независимый репозиторий, вы доверяете его владельцу распространять пакеты и подписывать метаданные. Сверьте отпечаток ключа по доверенному источнику.
 
-В выводе источником пакета teleport должен быть только flex0id.github.io/teleport. Если обнаружен дополнительный источник, отключите соответствующую секцию .repo или строку/stanza .list/.sources, не затрагивая системные репозитории.
-
-## 2. Штатное обновление Teleport
-
-После однократной настройки обновления выполняются стандартными командами от root, без повторного запуска install-repo.sh.
+## 2. Установка Teleport
 
 **Rocky Linux**
 
 ~~~bash
-dnf update -y
+sudo dnf install -y teleport
 ~~~
 
 **Ubuntu / Debian**
 
 ~~~bash
-apt update && apt dist-upgrade -y
+sudo apt update && sudo apt install -y teleport
 ~~~
 
-Эти команды обновляют также остальные системные пакеты. Для обновления только Teleport можно использовать dnf upgrade -y teleport или apt install --only-upgrade -y teleport после apt update.
+## 3. Обновление Teleport
 
-Проверка:
+После однократного подключения репозитория используйте штатные команды пакетного менеджера. Повторный запуск установщика не требуется.
+
+**Rocky Linux**
+
+~~~bash
+sudo dnf update -y
+~~~
+
+**Ubuntu / Debian**
+
+~~~bash
+sudo apt update && sudo apt dist-upgrade -y
+~~~
+
+Эти команды обновляют также остальные системные пакеты. Для обновления только Teleport:
+
+~~~bash
+sudo dnf upgrade -y teleport
+~~~
+
+~~~bash
+sudo apt update && sudo apt install --only-upgrade -y teleport
+~~~
+
+Если команды выполняются под root, sudo не требуется.
+
+Репозиторий содержит последнюю успешно опубликованную стабильную серверную версию из GitHub Releases. Teleport Connect и другие дополнительные дистрибутивы доступны в Releases, но не индексируются в APT/DNF.
+
+> Перед обновлением основных версий ознакомьтесь с требованиями производителя, сделайте резервную копию и соблюдайте порядок обновления компонентов кластера. Установка пакета не гарантирует перезапуск уже работающей службы.
+
+## 4. Проверка и диагностика
+
+**Rocky Linux**
+
+~~~bash
+dnf list --showduplicates teleport
+~~~
+
+**Ubuntu / Debian**
+
+~~~bash
+apt-cache policy teleport
+~~~
+
+Убедитесь, что пакет предлагается из `https://flex0id.github.io/teleport/`. Если имеются дополнительные нестандартные источники пакета, отключите их, не затрагивая системные репозитории.
+
+Проверка установленной версии:
 
 ~~~bash
 teleport version
 systemctl status teleport --no-pager
 ~~~
 
-Репозиторий предлагает максимальную опубликованную стабильную версию из GitHub Releases после успешной сборки и развёртывания Pages. Например, 19.0.1. Новые версии производителя не загружаются автоматически: их утверждает владелец репозитория.
+### Адреса репозитория
 
-> Важно: при переходе между основными версиями (например, 18 → 19) проверьте совместимость, требования к обновлению и резервному копированию в документации Teleport. Обновляйте Auth/Proxy до SSH agents. Проверяйте версию реально запущенного процесса: установка пакета не гарантирует перезапуск службы. Teleport должен быть установлен как RPM или DEB; ручная установка бинарника требует отдельной миграции.
-
-## 3. Публикация новой версии
-
-1. Получите оригинальные пакеты производителя и независимо проверьте их происхождение и контрольные суммы.
-2. Создайте draft release в [GitHub Releases](https://github.com/fLex0id/teleport/releases/new).
-3. Укажите тег, например 19.0.1 (также поддерживаются v19.0.1 и teleport-v19.0.1; не дублируйте одну версию разными тегами).
-4. Загрузите обязательные серверные пакеты:
-   - `teleport-19.0.1-1.x86_64.rpm`
-   - `teleport_19.0.1_amd64.deb`
-5. Нажмите **Publish release**. Дополнительные пакеты Teleport Connect и Windows installers могут храниться в Releases, но не включаются в APT/RPM индексы.
-6. Проверьте успешное завершение workflow **Publish approved Teleport package repositories** и развёртывание Pages.
-
-GitHub Actions выбирает максимальную стабильную версию по числовым компонентам, проверяет SHA256 вложений и метаданные RPM/DEB, формирует индексы, подписывает их и публикует на GitHub Pages. При ошибке сборки новый сайт не развёртывается. Если релиз опубликован до загрузки всех пакетов, запустите workflow вручную.
-
-Текущая опубликованная версия Pages: [current-release.txt](https://flex0id.github.io/teleport/current-release.txt).
-
-## 4. Первичная настройка публикации (только владелец)
-
-На доверенной Linux-машине с установленными gh и gpg под обычным пользователем:
-
-~~~bash
-gh auth login
-curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/setup-publisher.sh -o /tmp/setup-publisher.sh
-less /tmp/setup-publisher.sh
-bash /tmp/setup-publisher.sh
-~~~
-
-Скрипт использует существующий ключ из ~/.gnupg-teleport-repo/ либо создаёт новый, если ключ отсутствует. При миграции предпочтительно сохранить прежний ключ. Не создавайте новый ключ случайно на другой машине. Сохраните fingerprint и защищённую офлайн-копию ключа.
-
-Настраиваются Actions Secrets:
-
-- TELEPORT_REPO_GPG_PRIVATE_KEY
-- TELEPORT_REPO_GPG_PASSPHRASE
-
-Если автоматическое включение Pages не удалось: Settings → Pages → Build and deployment → Source → GitHub Actions.
-
-После настройки secrets и публикации релиза запустите [workflow](https://github.com/fLex0id/teleport/actions/workflows/teleport-packages.yml) вручную через Run workflow (main).
-
-## 5. Адреса и диагностика
-
-| Ресурс | URL |
+| Ресурс | Адрес |
 |---|---|
 | APT | https://flex0id.github.io/teleport/apt/ |
 | RPM | https://flex0id.github.io/teleport/rpm/x86_64/ |
-| APT InRelease | https://flex0id.github.io/teleport/apt/dists/stable/InRelease |
-| RPM repomd.xml | https://flex0id.github.io/teleport/rpm/x86_64/repodata/repomd.xml |
-| Public key | https://flex0id.github.io/teleport/teleport-repo.asc |
+| Public GPG key | [teleport-repo.asc](https://flex0id.github.io/teleport/teleport-repo.asc) |
+| Fingerprint | [signing-fingerprint.txt](https://flex0id.github.io/teleport/signing-fingerprint.txt) |
 
-При недоступности Pages или ошибке подписи не отключайте проверку GPG. Проверьте Actions, доступность Pages и доверенный fingerprint. Старые релизы сохраняются для ручного отката; Pages индексирует только последнюю утверждённую версию.
+APT проверяет подписанные метаданные InRelease. DNF проверяет подпись метаданных через repo_gpgcheck=1; отдельные RPM не переподписываются (gpgcheck=0), их контрольные суммы защищены подписанными метаданными. При ошибке подписи не отключайте проверку GPG.
 
-RPM: подписаны метаданные репозитория (repo_gpgcheck=1), отдельные RPM не переподписываются (gpgcheck=0); контрольные суммы пакетов защищены подписанными метаданными. APT: подписан InRelease. SHA256 вложений GitHub подтверждает целостность загрузки, но не заменяет проверку происхождения пакета производителя. Не публикуйте секретный ключ. Учитывайте срок действия ключа и ограничения GitHub Pages.
+## 5. Лицензирование
 
-## 6. Структура проекта
+Собственные скрипты, конфигурации CI/CD и документация распространяются по [MIT License](LICENSE). MIT не распространяется на оригинальные пакеты Teleport и сторонние компоненты.
 
-| Файл | Назначение |
-|---|---|
-| [install-repo.sh](install-repo.sh) | Однократное подключение Linux-сервера |
-| [setup-publisher.sh](setup-publisher.sh) | Настройка ключа и публикации |
-| [build-repo.sh](build-repo.sh) | Проверка пакетов, сборка и подпись индексов |
-| [teleport-packages.yml](.github/workflows/teleport-packages.yml) | CI/CD и развёртывание GitHub Pages |
+[LICENSE-TELEPORT](LICENSE-TELEPORT) содержит текст Teleport Community Edition License для ознакомления. Для каждой версии и компонента действуют применимые лицензии и уведомления, поставляемые с оригинальными пакетами.
 
-## 7. Лицензирование
-
-Собственные скрипты, конфигурации CI/CD и документация этого репозитория распространяются по [MIT License](LICENSE). Лицензия MIT не распространяется на бинарные пакеты Teleport, сторонние компоненты и материалы правообладателей.
-
-Репозиторий является независимым зеркалом дистрибутивов Teleport и не аффилирован с Gravitational, Inc. Оригинальные бинарные пакеты распространяются на условиях применимых лицензий правообладателей.
-
-- [LICENSE-TELEPORT](LICENSE-TELEPORT) — текст Teleport Community Edition License из [официального репозитория](https://github.com/gravitational/teleport/blob/master/build.assets/LICENSE-community), приведённый для ознакомления.
-- Для конкретной версии и отдельных компонентов, включая Teleport Connect, необходимо соблюдать лицензии и уведомления, поставляемые с соответствующими пакетами.
-- Права на Teleport и его товарные знаки принадлежат соответствующим правообладателям.
-
-Перед использованием и распространением необходимо ознакомиться с применимыми лицензионными условиями, включая ограничения Community Edition. При публикации новых версий следует сверять текст лицензии с оригинальными пакетами и сохранять уведомления об авторских правах.
+Репозиторий не является официальным ресурсом производителя и не аффилирован с Gravitational, Inc. Права на Teleport и его товарные знаки принадлежат соответствующим правообладателям. Перед использованием и распространением ознакомьтесь с применимыми лицензионными условиями.
