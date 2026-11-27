@@ -6,6 +6,10 @@
 
 **[Релизы](https://github.com/fLex0id/teleport/releases)** · **[Текущая версия](https://flex0id.github.io/teleport/current-release.txt)** · **[Репозиторий пакетов](https://flex0id.github.io/teleport/)**
 
+> **Интерактивный установщик Teleport (Server / SSH Agent)**
+>
+> [**https://flex0id.github.io/teleport/tp.sh**](https://flex0id.github.io/teleport/tp.sh)
+
 ## Поддерживаемые платформы
 
 | Дистрибутив | Архитектура | Пакетный менеджер |
