@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-VERSION=2.2.0
+VERSION=2.2.1
 BASE=https://flex0id.github.io/teleport
 REPO_HOST=flex0id.github.io
 REPO_IPS=(185.199.108.153 185.199.109.153 185.199.110.153 185.199.111.153)
@@ -23,7 +23,7 @@ fail(){ say "[ERROR] $*" >&2; return 1; }
 ask(){ local v; IFS= read -r -p "$1 " v </dev/tty || exit 130; ANSWER=$v; }
 yesno(){ while :; do ask "$1 [y/N]"; case "$ANSWER" in y|Y|yes|YES) return 0;; ''|n|N|no|NO) return 1;; *) say 'Enter y or n.';; esac; done; }
 choice(){ while :; do ask "$1"; case "$ANSWER" in '') ANSWER=$2;; esac; if [[ $ANSWER =~ ^[0-9]$ ]] && (( ANSWER <= $3 )); then return; fi; say 'Invalid choice. Try again.'; done; }
-domain_ok(){ [[ $1 =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ && $(printf %s "$1" | wc -c) -le 253 ]]; }
+domain_ok(){ ! ip_ok "$1" && [[ $1 =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ && $(printf %s "$1" | wc -c) -le 253 ]]; }
 ip_ok(){ local a b c d x; [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; IFS=. read -r a b c d <<<"$1"; for x in "$a" "$b" "$c" "$d"; do (( 10#$x <= 255 )) || return 1; done; }
 ask_domain(){ while :; do ask "$1"; if domain_ok "$ANSWER"; then return; fi; say 'Enter a valid FQDN, without https:// or port.'; done; }
 ask_name(){ while :; do ask "$1 [$2]"; ANSWER=${ANSWER:-$2}; [[ $ANSWER =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$ ]] && return; say 'Use ASCII letters, digits, dots, hyphens or underscores.'; done; }
@@ -47,12 +47,12 @@ repo_probe(){
     repo_report 'NORMAL - system resolver; emergency fallback not used.'
     return 0
   else rc=$?; fi
-  if ((rc != 6)); then
+  if ((rc != 6 && rc != 28)); then
     repo_report "FAILED - normal HTTPS error (curl $rc); emergency fallback not used."
     fail "Repository HTTPS failed (curl $rc); DNS fallback not applicable."
     return 1
   fi
-  say '[WARN] Repository DNS failed. Trying temporary fallback.'
+  say '[WARN] Repository DNS failed or HTTPS timed out. Trying temporary fallback.'
   if command -v dig >/dev/null 2>&1; then
     for resolver in 9.9.9.9 1.1.1.1 8.8.8.8; do
       while IFS= read -r candidate; do
@@ -120,7 +120,9 @@ deps(){
     run 'Refresh APT' apt-get -o DPkg::Lock::Timeout=120 update &&
     run 'Install prerequisites' env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates curl gnupg python3 iproute2 openssl util-linux dnsutils
   else
-    run 'Install prerequisites' dnf -y install ca-certificates curl gnupg2 python3 iproute openssl util-linux bind-utils
+    local -a packages=(ca-certificates gnupg2 python3 iproute openssl util-linux bind-utils)
+    command -v curl >/dev/null || packages+=(curl)
+    run 'Install prerequisites' dnf -y install "${packages[@]}"
   fi
 }
 dns_test(){ local h; for h in github.com raw.githubusercontent.com flex0id.github.io; do timeout 10 getent ahostsv4 "$h" >/dev/null || return 1; done; }
@@ -128,12 +130,14 @@ dns_restore(){
   [[ -d $DNSBACK ]] || { say 'No saved DNS configuration.'; return 0; }
   cp -a "$DNSBACK/resolv.conf" /etc/.teleport-resolv-restore.$$ || return 1
   mv -Tf /etc/.teleport-resolv-restore.$$ /etc/resolv.conf || return 1
-  rm -f "$NMCONF"
-  if [[ -f $DNSBACK/nm ]]; then systemctl reload NetworkManager || say 'Check NetworkManager manually.'; fi
+  rm -f "$NMCONF" || return 1
+  if [[ -f $DNSBACK/nm ]]; then systemctl reload NetworkManager || return 1; fi
   systemctl disable --now "$DNSUNIT" >/dev/null 2>&1 || :
-  rm -f "/etc/systemd/system/$DNSUNIT" "$DNSCONF"
-  systemctl daemon-reload
-  if dns_test; then rm -rf "$DNSBACK"; say '[OK] Original DNS restored.'; else fail "Original DNS restored but resolution failed; backup: $DNSBACK"; fi
+  rm -f "/etc/systemd/system/$DNSUNIT" "$DNSCONF" || return 1
+  systemctl daemon-reload || return 1
+  rm -rf "$DNSBACK" || return 1
+  if dns_test; then say '[OK] Original DNS restored.'; else say '[WARN] Original DNS restored, but DNS resolution still fails.'; fi
+  return 0
 }
 dns_stamp(){
   python3 - "$@" <<'PY'
@@ -182,9 +186,23 @@ dns_change(){
   mkdir -m 700 "$DNSBACK" || return 1
   cp -a /etc/resolv.conf "$DNSBACK/resolv.conf" || { rmdir "$DNSBACK"; return 1; }
   DNS_PENDING=1
+  # Bootstrap the selected UDP resolver before installing any missing DNS tools.
+  # DoH uses these addresses temporarily only with explicit consent.
+  if ! command -v dig >/dev/null || { [[ $mode == 2 ]] && ! command -v dnscrypt-proxy >/dev/null; }; then
+    if [[ $mode == 2 ]]; then yesno 'Allow temporary UDP DNS for installing DoH dependencies?' || return 1; fi
+    local bootstrap
+    bootstrap=$(mktemp /etc/.teleport-bootstrap.XXXXXX) || return 1
+    { for ip in $ips; do say "nameserver $ip"; done; say "options timeout:2 attempts:2"; } >"$bootstrap" || return 1
+    chmod 644 "$bootstrap" && mv -Tf "$bootstrap" /etc/resolv.conf || return 1
+    if ! command -v dig >/dev/null; then
+      if [[ $PM == apt ]]; then run "Refresh APT" apt-get -o DPkg::Lock::Timeout=120 update && run "Install DNS tools" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y dnsutils || return 1
+      else run "Install DNS tools" dnf -y install bind-utils || return 1; fi
+    fi
+    if [[ $mode == 2 && $PM == apt ]]; then run "Install DoH prerequisites" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y python3 ca-certificates || return 1; fi
+  fi
   if [[ $mode == 2 ]]; then
     if ! command -v dnscrypt-proxy >/dev/null; then
-      if [[ $PM == apt ]]; then run 'Install DNSCrypt proxy' apt-get install -y dnscrypt-proxy || return 1
+      if [[ $PM == apt ]]; then run 'Install DNSCrypt proxy' env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y dnscrypt-proxy || return 1
       else
         if ! run 'Install DNSCrypt proxy' dnf -y install dnscrypt-proxy; then
           if [[ $ID == rocky || $ID == almalinux ]] && yesno 'Enable EPEL to install DNSCrypt proxy?'; then
@@ -200,7 +218,7 @@ dns_change(){
     {
       say "listen_addresses = ['127.0.2.53:53']"
       say 'ipv4_servers = true'; say 'ipv6_servers = false'
-      say 'dnscrypt_servers = false'; say 'doh_servers = true'; say 'odoh_servers = false'
+      say 'dnscrypt_servers = false'; say 'doh_servers = true'
       say 'ignore_system_dns = true'; say 'timeout = 5000'; say 'cache = true'
       for ip in $ips; do i=$((i+1)); names="${names:+$names, }'up$i'"; done
       say "server_names = [$names]"
@@ -253,9 +271,9 @@ install_package(){
     local version; repo_fetch "$BASE/current-release.txt" "$TMP/current-release.txt" || return 1
     version=$(cat "$TMP/current-release.txt") || return 1
     version=$(printf '%s' "$version" | sed -E 's/^(teleport-v|v)//')
-    apt-cache madison teleport | awk -F'|' -v v="$version" '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if ($2==v && $3 ~ /https:\/\/flex0id[.]github[.]io\/teleport\/apt/) found=1} END{exit !found}' || return 1
+    apt-cache madison teleport | awk -F'|' -v v="$version" '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if ($2==v && $3 ~ /https:\/\/flex0id[.]github[.]io\/teleport\/apt/) found=1} END{exit !found}' || { fail "Version $version is missing from the managed APT repository"; return 1; }
     [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail 'No valid package candidate'; return 1; }
-    run "Install Teleport $version" repo_run env DEBIAN_FRONTEND=noninteractive apt-get install -y "teleport=$version"
+    run "Install Teleport $version" repo_run env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "teleport=$version"
   else
     run 'Install Teleport from managed repository' repo_run dnf -y install teleport --setopt=flex0id-teleport.priority=1
   fi
@@ -314,7 +332,7 @@ main_install(){
   else
     while :; do ask 'Absolute fullchain PEM path:'; cert=$ANSWER; [[ $cert == /* && -r $cert ]] && break; say 'File not readable.'; done
     while :; do ask 'Absolute private key PEM path:'; key=$ANSWER; [[ $key == /* && -r $key ]] && break; say 'File not readable.'; done
-    openssl x509 -in "$cert" -noout -checkhost "$CLUSTER" || return 1
+    openssl x509 -in "$cert" -noout -checkhost "$CLUSTER" | grep -q "does match certificate" || { fail "Certificate does not match $CLUSTER"; return 1; }
   fi
   [[ -z $(ss -Hlt '( sport = :443 )') ]] || { fail 'TCP 443 is already in use.'; return 1; }
   getent ahostsv4 "$CLUSTER" || { fail 'Cluster domain does not resolve.'; return 1; }
@@ -595,11 +613,12 @@ main(){
     choice 'Select [0]:' 0 8
     case "$ANSWER" in
       0) return 0;;
-      1|2|3)
+      3) dns_change || say "DNS change unsuccessful."; if ((DNS_PENDING)); then dns_restore || :; DNS_PENDING=0; fi;;
+      1|2)
         local action=$ANSWER
         if deps; then
-          if [[ $PM == apt ]]; then run 'Install YAML support' apt-get install -y python3-yaml || continue; else run 'Install YAML support' dnf -y install python3-pyyaml || continue; fi
-          case "$action" in 1) main_install || say 'Installation stopped; inspect log before retrying.';; 2) agent_install || say 'Installation stopped; inspect log before retrying.';; 3) dns_change || say 'DNS change unsuccessful.'; if ((DNS_PENDING)); then dns_restore || :; DNS_PENDING=0; fi;; esac
+          if [[ $PM == apt ]]; then run 'Install YAML support' env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y python3-yaml || continue; else run 'Install YAML support' dnf -y install python3-pyyaml || continue; fi
+          case "$action" in 1) main_install || say 'Installation stopped; inspect log before retrying.';; 2) agent_install || say 'Installation stopped; inspect log before retrying.';; esac
         fi;;
       4) dns_restore || :;;
       5) admin || say 'Could not create user.';;
@@ -609,4 +628,4 @@ main(){
     esac
   done
 }
-[[ ${BASH_SOURCE[0]} != "$0" ]] || main "$@"
+[[ ${BASH_SOURCE[0]:-} != "$0" && -n ${BASH_SOURCE[0]:-} ]] || main "$@"
