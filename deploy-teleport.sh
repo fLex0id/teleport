@@ -156,7 +156,7 @@ dns_change(){
   say '1 Quad9   2 Cloudflare   3 Google   4 Cisco OpenDNS'
   say '5 NextDNS (UDP / DoH profile)   6 AdGuard   7 Custom UDP   0 Keep current'
   choice 'DNS provider [0]:' 0 7
-  local p=$ANSWER ips host path=/dns-query mode ip stamp names='' i=0 bin
+  local p=$ANSWER ips host path=/dns-query mode ip stamp names='' i=0 bin apt_refreshed=0
   case "$p" in
     0) return 0;;
     1) ips='9.9.9.9 149.112.112.112'; host=dns.quad9.net;;
@@ -195,14 +195,16 @@ dns_change(){
     { for ip in $ips; do say "nameserver $ip"; done; say "options timeout:2 attempts:2"; } >"$bootstrap" || return 1
     chmod 644 "$bootstrap" && mv -Tf "$bootstrap" /etc/resolv.conf || return 1
     if ! command -v dig >/dev/null; then
-      if [[ $PM == apt ]]; then run "Refresh APT" apt-get -o DPkg::Lock::Timeout=120 update && run "Install DNS tools" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y dnsutils || return 1
+      if [[ $PM == apt ]]; then run "Refresh APT" apt-get -o DPkg::Lock::Timeout=120 update && run "Install DNS tools" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y dnsutils || return 1; apt_refreshed=1
       else run "Install DNS tools" dnf -y install bind-utils || return 1; fi
     fi
-    if [[ $mode == 2 && $PM == apt ]]; then run "Refresh APT for DoH" apt-get -o DPkg::Lock::Timeout=120 update || return 1; run "Install DoH prerequisites" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y python3 ca-certificates || return 1; fi
+    if [[ $mode == 2 && $PM == apt ]]; then if (( ! apt_refreshed )); then run "Refresh APT for DoH" apt-get -o DPkg::Lock::Timeout=120 update || return 1; apt_refreshed=1; fi; run "Install DoH prerequisites" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y python3 ca-certificates || return 1; fi
   fi
   if [[ $mode == 2 ]]; then
     if ! command -v dnscrypt-proxy >/dev/null; then
-      if [[ $PM == apt ]]; then run 'Install DNSCrypt proxy' env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y dnscrypt-proxy || return 1
+      if [[ $PM == apt ]]; then
+        if (( ! apt_refreshed )); then run 'Refresh APT for DoH' apt-get -o DPkg::Lock::Timeout=120 update || return 1; fi
+        run 'Install DNSCrypt proxy' env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y dnscrypt-proxy || return 1
       else
         if ! run 'Install DNSCrypt proxy' dnf -y install dnscrypt-proxy; then
           if [[ $ID == rocky || $ID == almalinux ]] && yesno 'Enable EPEL to install DNSCrypt proxy?'; then
@@ -521,15 +523,15 @@ if p.is_symlink() or not p.is_file():
 original = p.read_text()
 begin = "# BEGIN TELEPORT-DEPLOY OPENSSH"
 end = "# END TELEPORT-DEPLOY OPENSSH"
-pattern = re.compile(r"(?m)^" + re.escape(begin) + r"\n(?:[^\n]*\n)*?^" + re.escape(end) + r"\n")
 if action == "remove":
-    updated, count = pattern.subn("", original)
-    if count > 1 or begin in updated or end in updated:
-        sys.exit("Malformed managed UFW block: " + filename)
-    if count == 0:
+    # Remove only our marker lines and exact tagged rules, not administrator edits.
+    owned = re.compile(r"^-A (?:ufw|ufw6)-before-input -p tcp -m tcp --dport [0-9]+ -m comment --comment teleport-deploy-openssh -j DROP$")
+    lines = original.splitlines(keepends=True)
+    updated = "".join(line for line in lines if line.rstrip("\r\n") not in (begin, end) and not owned.fullmatch(line.rstrip("\r\n")))
+    if updated == original:
         sys.exit(0)
 else:
-    if begin in original or end in original:
+    if begin in original or end in original or "teleport-deploy-openssh" in original:
         sys.exit("Managed UFW block already exists: " + filename)
     if not ports or not all(v.isdigit() and 0 < int(v) <= 65535 for v in ports):
         sys.exit("Invalid ports")
@@ -542,7 +544,7 @@ else:
         sys.exit("Missing UFW before-input chain")
     # Place after chain declarations, before any filter rules.
     pos = next((i for i in range(start+1,finish) if lines[i].lstrip().startswith(("-A ","-I "))), finish)
-    block = begin+"\n"+"".join("-A "+chain+" -p tcp -m tcp --dport "+v+" -j DROP\n" for v in ports)+end+"\n"
+    block = begin+"\n"+"".join("-A "+chain+" -p tcp -m tcp --dport "+v+" -m comment --comment teleport-deploy-openssh -j DROP\n" for v in ports)+end+"\n"
     lines.insert(pos, block)
     updated = "".join(lines)
 st = p.stat()
@@ -568,7 +570,7 @@ ufw_verify_chain(){
   mapfile -t actual < <(printf '%s\n' "$rules" | grep -F -- "-A $chain " || :)
   for port in "$@"; do
     line=${actual[i]:-}
-    [[ $line == "-A $chain -p tcp -m tcp --dport $port -j DROP" ]] || { fail "UFW priority block not verified for TCP $port ($chain)."; return 1; }
+    [[ $line == "-A $chain -p tcp -m tcp --dport $port -m comment --comment teleport-deploy-openssh -j DROP" || $line == "-A $chain -p tcp -m tcp --dport $port -m comment --comment \"teleport-deploy-openssh\" -j DROP" ]] || { fail "UFW priority block not verified for TCP $port ($chain)."; return 1; }
     i=$((i+1))
   done
 }
@@ -582,9 +584,13 @@ ufw_lockdown(){
       chain=ufw6-before-input
     else chain=ufw-before-input; fi
     cp -a "$file" "$backup/${file##*/}" || return 1
-    # Record only after successful edit; retain on subsequent reload failures.
-    ufw_edit add "$file" "$chain" "$@" || return 1
+    # Refuse a stale block from another invocation before recording ownership.
+    if grep -Eq 'TELEPORT-DEPLOY OPENSSH|teleport-deploy-openssh' "$file"; then
+      fail "Existing managed UFW block in $file; restore previous changes first."; return 1
+    fi
+    # Journal intent before touching the rules so an interruption can roll back.
     printf '%s\n' "$file" >>"$backup/ufw.managed" || return 1
+    ufw_edit add "$file" "$chain" "$@" || return 1
   done
   ufw reload || return 1
   ufw_verify_chain iptables ufw-before-input "$@" || return 1

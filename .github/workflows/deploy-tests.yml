@@ -7,6 +7,7 @@ on:
       - setup-publisher.sh
       - build-repo.sh
       - tests/deploy-test.sh
+      - tests/ufw-integration.sh
       - .github/workflows/deploy-tests.yml
   workflow_dispatch:
 permissions:
@@ -24,3 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: bash tests/deploy-test.sh
+  ufw-integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ufw iptables iproute2
+      - run: sudo unshare --mount --net --propagation private bash tests/ufw-integration.sh

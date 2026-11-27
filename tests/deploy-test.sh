@@ -163,17 +163,17 @@ COMMIT
 RULES
 cp "$rules" "$scratch/original"
 ufw_edit add "$rules" ufw-before-input 22 2222
-grep -Fq -- '-A ufw-before-input -p tcp -m tcp --dport 22 -j DROP' "$rules"
+grep -Fq -- '-A ufw-before-input -p tcp -m tcp --dport 22 -m comment --comment teleport-deploy-openssh -j DROP' "$rules"
 [[ $(grep -m1 '^-A ' "$rules") == *'-j DROP' ]]
 ok 'UFW blocks precede allow rules'
-sed -i '/^COMMIT/i -A ufw-before-input -p tcp --dport 80 -j ACCEPT' "$rules"
+sed -i '/^# END TELEPORT-DEPLOY OPENSSH/i -A ufw-before-input -p tcp --dport 80 -j ACCEPT' "$rules"
 ufw_edit remove "$rules" unused
 grep -Fq -- '--dport 80 -j ACCEPT' "$rules"
 grep -Fq -- '--dport 22 -j ACCEPT' "$rules"
 ! grep -q 'TELEPORT-DEPLOY' "$rules"
 ufw_edit remove "$rules" unused
 ok 'UFW restore preserves original and newly added rules; repeat is safe'
-mock_iptables(){ printf '%s\n' '-N ufw-before-input' '-A ufw-before-input -p tcp -m tcp --dport 22 -j DROP' '-A ufw-before-input -p tcp -m tcp --dport 2222 -j DROP'; }
+mock_iptables(){ printf '%s\n' '-N ufw-before-input' '-A ufw-before-input -p tcp -m tcp --dport 22 -m comment --comment teleport-deploy-openssh -j DROP' '-A ufw-before-input -p tcp -m tcp --dport 2222 -m comment --comment teleport-deploy-openssh -j DROP'; }
 ufw_verify_chain mock_iptables ufw-before-input 22 2222
 if ufw_verify_chain mock_iptables ufw-before-input 2222; then exit 1; fi
 ok 'UFW verifies actual rule ordering'
@@ -192,6 +192,6 @@ if wait_agent; then exit 1; fi
 teleport(){ printf '%s\n' '{"status":"ok"}'; }
 wait_agent
 ok 'agent requires confirmed heartbeat, not merely active systemd'
-declare -f dns_change | grep -q 'Refresh APT for DoH'
+grep -q 'Refresh APT for DoH' <<<"$(declare -f dns_change)"
 ok 'DoH refreshes APT indexes even with dig installed'
 printf '%s tests passed\n' "$count"
