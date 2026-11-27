@@ -39,7 +39,7 @@ name=fLex0id approved Teleport packages
 baseurl=https://flex0id.github.io/teleport/rpm/x86_64/
 enabled=1
 priority=1
-includepkgs=teleport
+includepkgs=teleport,teleport-connect
 repo_gpgcheck=1
 # The signed repomd.xml authenticates the checksum of the selected RPM.
 # RPM payload signatures are not yet issued by this repository.
@@ -81,7 +81,7 @@ for path in sorted(Path("/etc/yum.repos.d").glob("*.repo")):
 PYRPM
     echo 'DNF repository installed. Verification:'
     dnf -y makecache --refresh --disablerepo='*' --enablerepo='flex0id-teleport'
-    dnf repoquery --disablerepo='*' --enablerepo='flex0id-teleport' --available teleport || true
+    dnf repoquery --disablerepo='*' --enablerepo='flex0id-teleport' --available teleport teleport-connect || true
 elif command -v apt-get >/dev/null && [[ -f /etc/debian_version ]]; then
     [[ "$arch" == x86_64 ]] || { echo "Unsupported APT architecture: $arch" >&2; exit 1; }
     curl -4fsSL --retry 3 "$base/apt/dists/stable/InRelease" -o "$tmp/InRelease"
@@ -92,11 +92,11 @@ elif command -v apt-get >/dev/null && [[ -f /etc/debian_version ]]; then
 deb [arch=amd64 signed-by=/etc/apt/keyrings/flex0id-teleport.asc] https://flex0id.github.io/teleport/apt stable main
 REPO
     cat > /etc/apt/preferences.d/flex0id-teleport <<'PIN'
-Package: teleport
+Package: teleport teleport-connect
 Pin: origin "flex0id.github.io"
 Pin-Priority: 700
 
-Package: teleport
+Package: teleport teleport-connect
 Pin: version *
 Pin-Priority: -1
 PIN
@@ -173,7 +173,7 @@ for path, updated in edits:
 PY
     echo 'APT repository installed. Verification:'
     apt-get update
-    apt-cache policy teleport
+    apt-cache policy teleport teleport-connect
 else
     echo 'Unsupported Linux distribution or package manager' >&2
     exit 1
