@@ -69,15 +69,20 @@ dig(){ if [[ $MODE == dynamic ]]; then printf '%s\n' 'not-an-ip' '192.0.2.10'; f
 repo_probe
 [[ -z $REPO_FALLBACK_IP && $(wc -l <"$calls") == 1 ]]
 ! grep -q -- --resolve "$calls"
+[[ $REPO_DNS_MODE == NORMAL* ]]
+grep -q 'Repository access: NORMAL' "$LOG"
 ok 'normal DNS never uses fallback'
 : >"$calls"; MODE=tls
 if repo_probe; then exit 1; fi
 [[ -z $REPO_FALLBACK_IP && $(wc -l <"$calls") == 1 ]]
+[[ $REPO_DNS_MODE == FAILED*'emergency fallback not used.' ]]
 ok 'TLS errors never trigger fallback'
 : >"$calls"; MODE=dns
 repo_probe
 [[ $REPO_FALLBACK_IP == 185.199.109.153 ]]
 grep -q -- '185.199.108.153' "$calls"
+[[ $REPO_DNS_MODE == 'EMERGENCY - static GitHub Pages IP; verified HTTPS to 185.199.109.153.' ]]
+grep -q 'Repository access: EMERGENCY - static GitHub Pages IP' "$LOG"
 ok 'DNS failure tries another documented Pages address'
 repo_fetch "$BASE/install-repo.sh" "$scratch/download"
 grep -q -- "--resolve $REPO_HOST:443:185.199.109.153" "$calls"
@@ -87,10 +92,13 @@ ok 'fallback rejects unrelated domains'
 MODE=dead
 if repo_probe; then exit 1; fi
 [[ -z $REPO_FALLBACK_IP ]]
+[[ $REPO_DNS_MODE == FAILED* ]]
 ok 'all failed addresses stop safely'
 MODE=dynamic
 repo_probe
 [[ $REPO_FALLBACK_IP == 192.0.2.10 ]]
+[[ $REPO_DNS_MODE == 'EMERGENCY - alternate DNS 9.9.9.9; verified HTTPS to 192.0.2.10.' ]]
+grep -q 'Repository access: EMERGENCY - alternate DNS' "$LOG"
 ok 'alternate DNS result tried before static addresses'
 MODE=normal
 repo_probe
