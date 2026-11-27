@@ -285,9 +285,57 @@ time_check(){
   local n; for n in {1..5}; do [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null || :) == yes ]] && return 0; sleep 2; done
   yesno 'Continue only if the displayed time is accurate?'
 }
+# Resume only deployments explicitly started by this installer.
+deployment_begin(){
+  local role=$1 endpoint=$2
+  [[ ! -e $STATE/role && ! -e $STATE/deployment.pending ]] || return 1
+  printf '%s\n%s\n' "$role" "$endpoint" >"$STATE/deployment.pending"
+}
+deployment_finish(){
+  printf '%s\n' "$1" >"$STATE/role" || return 1
+  rm -f "$STATE/deployment.pending"
+}
+deployment_resume(){
+  local role endpoint
+  [[ -f $STATE/deployment.pending && ! -f $STATE/role ]] || { fail 'No interrupted deployment recorded.'; return 1; }
+  { IFS= read -r role && IFS= read -r endpoint; } <"$STATE/deployment.pending" || return 1
+  [[ $role == cluster || $role == agent ]] && domain_ok "$endpoint" || return 1
+  if [[ ! -f $CONF ]]; then
+    fail 'Configuration was not installed. Use the original installation menu to retry.'
+    return 1
+  fi
+  [[ ! -L $CONF ]] || { fail 'Unexpected configuration symlink.'; return 1; }
+  teleport configure --test="$CONF" || return 1
+  yesno "Resume $role deployment for $endpoint with existing configuration?" || return 0
+  if [[ $role == cluster ]]; then
+    CLUSTER=$endpoint
+    open_https || return 1
+  fi
+  run 'Enable Teleport' systemctl enable --now teleport || return 1
+  if [[ $role == cluster ]]; then
+    wait_cluster || return 1
+  else
+    sleep 5
+    systemctl is-active --quiet teleport || return 1
+    say 'Verify agent enrollment with tctl nodes ls on the main cluster.'
+  fi
+  deployment_finish "$role" || return 1
+  say '[OK] Deployment resumed.'
+  ssh_offer
+}
+deployment_prepare(){
+  local role=$1 endpoint=$2 oldrole oldendpoint
+  if [[ -f $STATE/deployment.pending ]]; then
+    { IFS= read -r oldrole && IFS= read -r oldendpoint; } <"$STATE/deployment.pending" || return 1
+    [[ $role == "$oldrole" && $endpoint == "$oldendpoint" ]] || { fail 'Interrupted deployment has a different role or endpoint.'; return 1; }
+    return 0
+  fi
+  deployment_begin "$role" "$endpoint"
+}
 existing_guard(){
   [[ ! -e $CONF && ! -L $CONF ]] || { fail "$CONF already exists; refusing overwrite."; return 1; }
   if [[ -d /var/lib/teleport && -n $(ls -A /var/lib/teleport) ]]; then fail 'Existing Teleport data; refusing overwrite.'; return 1; fi
+  if [[ -f $STATE/deployment.pending && ! -f $STATE/role ]]; then say 'Interrupted installation found; retry with the same role and endpoint.'; return 0; fi
   if command -v teleport >/dev/null || systemctl cat teleport.service >/dev/null 2>&1; then fail 'Existing Teleport installation; use normal package updates or manual recovery.'; return 1; fi
 }
 open_https(){
@@ -338,6 +386,7 @@ main_install(){
   getent ahostsv4 "$CLUSTER" || { fail 'Cluster domain does not resolve.'; return 1; }
   time_check || return 1
   yesno "Install cluster $CLUSTER with node $node?" || return 0
+  deployment_prepare cluster "$CLUSTER" || return 1
   install_package || return 1
   local -a args=(configure --cluster-name="$CLUSTER" --public-addr="$CLUSTER:443" --roles=auth,proxy,node -o stdout)
   if [[ $mode == 1 ]]; then args+=(--acme --acme-email="$email"); else args+=(--cert-file="$cert" --key-file="$key"); fi
@@ -360,7 +409,7 @@ PY
   open_https || return 1
   run 'Enable Teleport' systemctl enable --now teleport || return 1
   wait_cluster || return 1
-  printf '%s\n' cluster >"$STATE/role"
+  deployment_finish cluster || return 1
   say "[OK] Cluster ready: https://$CLUSTER"
   yesno 'Create administrator now?' && admin || :
   yesno 'Create enrollment token now?' && token_menu || :
@@ -385,10 +434,12 @@ agent_install(){
   while :; do IFS= read -r -s -p 'Join token: ' token </dev/tty || return 1; echo; [[ $token =~ ^[A-Za-z0-9_-]{16,256}$ ]] && break; say 'Invalid token, try again.'; done
   time_check || return 1
   yesno "Join $proxy as $node?" || return 0
+  deployment_prepare agent "$proxy" || return 1
   install_package || return 1
   printf '%s' "$token" >"$TMP/join-token" || return 1; unset token
   install -d -m 0700 /etc/teleport || return 1
-  [[ ! -e /etc/teleport/join-token ]] || return 1
+  [[ ! -L /etc/teleport/join-token ]] || return 1
+  if [[ -e /etc/teleport/join-token ]]; then yesno "Replace previous enrollment token for this interrupted deployment?" || return 1; fi
   install -m 0600 "$TMP/join-token" /etc/teleport/join-token || return 1
   rm -f "$TMP/join-token"
   teleport node configure --output="file://$TMP/agent.yaml" --proxy="$proxy:443" --token=/etc/teleport/join-token >/dev/null || return 1
@@ -406,7 +457,7 @@ PY
   run 'Enable Teleport agent' systemctl enable --now teleport || return 1
   sleep 5
   systemctl is-active --quiet teleport || { fail 'Agent not running; inspect journalctl -u teleport.'; return 1; }
-  printf '%s\n' agent >"$STATE/role"
+  deployment_finish agent || return 1
   say 'Agent process is running (not yet proof of enrollment). Confirm actual enrollment on the main server with: tctl nodes ls'
   say 'No inbound SSH port has been opened.'
   ssh_offer
@@ -664,8 +715,8 @@ main(){
     say ''; say "Teleport deploy $VERSION"
     say "Last repository DNS check: $REPO_DNS_MODE"
     say '1 Install main cluster'; say '2 Install SSH agent'; say '3 Configure DNS'; say '4 Restore original DNS'
-    say '5 Create administrator (main cluster)'; say '6 Generate agent token (main cluster)'; say '7 Status / repository DNS check'; say '8 OpenSSH management'; say '0 Exit'
-    choice 'Select [0]:' 0 8
+    say '5 Create administrator (main cluster)'; say '6 Generate agent token (main cluster)'; say '7 Status / repository DNS check'; say '8 OpenSSH management'; say '9 Resume interrupted deployment'; say '0 Exit'
+    choice 'Select [0]:' 0 9
     case "$ANSWER" in
       0) return 0;;
       3) dns_change || say "DNS change unsuccessful."; if ((DNS_PENDING)); then dns_restore || :; DNS_PENDING=0; fi;;
@@ -679,6 +730,7 @@ main(){
       5) admin || say 'Could not create user.';;
       6) token_menu || say 'Could not create token.';;
       8) ssh_menu;;
+      9) deployment_resume || say 'Resume unsuccessful; inspect the log.';;
       7) repo_probe || :; teleport version || :; systemctl status teleport --no-pager || :; journalctl -u teleport -n 15 --no-pager || :;;
     esac
   done
