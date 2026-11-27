@@ -17,11 +17,10 @@
 
 Выполните один раз на каждом Linux-сервере. Требуются Bash, curl, GnuPG, Python 3 и права администратора.
 
-Скачайте установщик, ознакомьтесь с его содержимым и запустите с указанным отпечатком публичного ключа.
+Скачайте установщик и запустите его с указанным отпечатком публичного ключа.
 
 ~~~bash
 curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh -o /tmp/install-teleport-repo.sh
-less /tmp/install-teleport-repo.sh
 sudo env TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash /tmp/install-teleport-repo.sh
 ~~~
 
