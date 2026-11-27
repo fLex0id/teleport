@@ -1,113 +1,136 @@
-# Teleport repository — RPM and APT updates from your GitHub Releases
+# Teleport — репозиторий обновлений для Linux
 
-**Your only recurring task:** publish a GitHub Release named `teleport-vX.Y.Z`
-with exactly the server RPM and DEB assets. GitHub Actions automatically builds,
-signs and publishes DNF/APT metadata to GitHub Pages. Hosts consume the packages
-using their normal `dnf update` and `apt update && apt dist-upgrade`.
+![Architecture](https://img.shields.io/badge/architecture-x86__64-blue) ![Packages](https://img.shields.io/badge/packages-RPM%20%7C%20DEB-blue)
 
-This is separate from rp.sh gateway development. No running Teleport or rp.sh
-installation is modified by repository publication.
+Независимый репозиторий официальных пакетов Teleport с управляемой публикацией версий и GPG-подписью метаданных. Предназначен для Rocky Linux, Ubuntu и Debian (x86_64 / amd64). Не является официальным репозиторием производителя.
 
-## ONE-TIME INITIALIZATION (publisher)
+**Релизы:** [GitHub Releases](https://github.com/fLex0id/teleport/releases) · **Публикация:** [GitHub Actions](https://github.com/fLex0id/teleport/actions) · **Пакеты:** [GitHub Pages](https://flex0id.github.io/teleport/)
 
-1. On a trusted Linux workstation, install `gh` (GitHub CLI) and `gpg`, then
-   authenticate with `gh auth login` as the repository owner. Do not run the
-   following setup as root.
+## 1. Подключение Linux-сервера
 
-2. Download the setup script from the **main branch** and inspect it:
+Выполняется один раз на каждом сервере, в том числе при переходе со старого репозитория reverse-proxy. Требуются Bash, curl, GnuPG, Python 3, права root и уже опубликованные подписанные метаданные.
 
-   ~~~bash
-   curl -fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/setup-publisher.sh -o setup-publisher.sh
-   less setup-publisher.sh
-   bash setup-publisher.sh
-   ~~~
-
-   The script reuses the existing dedicated GPG signing key, if present, or creates a new password-protected key in
-   `~/.gnupg-teleport-repo/`, uploads its protected export and passphrase
-   as GitHub Actions secrets, and attempts to enable GitHub Pages with
-   **Actions** as its source. If Pages API setup fails, use GitHub UI:
-   Settings → Pages → Build and deployment → Source → GitHub Actions.
-
-   **Write down the 40-character GPG fingerprint printed by the script.**
-   It is required once on every server. Keep a private offline backup of
-   `~/.gnupg-teleport-repo/`. Do not share the private signing key.
-
-3. Publish the initial release with both server packages (see below).
-
-4. Open GitHub Actions → **Publish approved Teleport package repositories** →
-   Run workflow (main). Wait until the workflow and Pages deployment succeed.
-
-5. Verify that these URLs work:
-   - https://flex0id.github.io/teleport/
-   - https://flex0id.github.io/teleport/apt/dists/stable/InRelease
-   - https://flex0id.github.io/teleport/rpm/x86_64/repodata/repomd.xml
-
-Only after successful publication configure Linux servers.
-
-## ONE-TIME INITIALIZATION (each Rocky Linux / Ubuntu host)
-
-Run as root through ordinary SSH, not your only Teleport connection:
+Подключайтесь через независимый SSH-канал. Сначала скачайте и проверьте скрипт, затем укажите ранее проверенный 40-символьный fingerprint ключа подписи (вывод setup-publisher.sh или сохранённый доверенный ключ).
 
 ~~~bash
 curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh -o /tmp/install-teleport-repo.sh
-TELEPORT_REPO_EXPECTED_FPR='YOUR_OFFLINE_VERIFIED_40_HEX_FINGERPRINT' bash /tmp/install-teleport-repo.sh
+less /tmp/install-teleport-repo.sh
+sudo env TELEPORT_REPO_EXPECTED_FPR='YOUR_VERIFIED_40_HEX_FINGERPRINT' bash /tmp/install-teleport-repo.sh
 ~~~
 
-The installer identifies the OS, verifies the trusted signing key and signed
-metadata, and creates native repo configuration. It does not restart Teleport.
+Если вы уже root, sudo не требуется.
 
-Rocky Linux:
+Установщик определяет пакетный менеджер, проверяет fingerprint и GPG-подпись метаданных, настраивает постоянный источник пакетов, отключает обнаруженные официальные источники Teleport и обновляет метаданные. Службы Teleport не перезапускаются, пакеты не обновляются.
+
+### Приоритет источников
+
+| Linux | Конфигурация | Политика |
+|---|---|---|
+| Rocky Linux | /etc/yum.repos.d/flex0id-teleport.repo | priority=1; includepkgs=teleport; repo_gpgcheck=1 |
+| Ubuntu / Debian | /etc/apt/sources.list.d/flex0id-teleport.list | signed-by; APT pin priority=700 для flex0id.github.io |
+
+Официальные источники отключаются с сохранением резервных копий изменённых файлов (.before-flex0id-teleport.bak). Старый стандартный файл flex0id-teleport заменяется новым. Нестандартные зеркала и дополнительные источники необходимо проверить вручную. APT pinning по имени хоста не различает разные пути одного GitHub Pages домена, поэтому дублирующие источники должны быть отключены.
+
+Проверка Rocky Linux:
 
 ~~~bash
-dnf update
+dnf repolist --enabled
+dnf --refresh repoquery --available teleport
 ~~~
 
-Ubuntu / Debian:
+Проверка Ubuntu / Debian:
 
 ~~~bash
-apt update && apt dist-upgrade
+apt-cache policy teleport
 ~~~
 
-Keep only this Teleport repository enabled. If additional repositories also
-offer the package named `teleport`, disable them or inspect priorities. The
-APT installer pins the package name to this GitHub Pages origin.
+В выводе источником пакета teleport должен быть только flex0id.github.io/teleport. Если обнаружен дополнительный источник, отключите соответствующую секцию .repo или строку/stanza .list/.sources, не затрагивая системные репозитории.
 
-## EVERY FUTURE TELEPORT RELEASE (your manual task)
+## 2. Штатное обновление Teleport
 
-1. Obtain the official server packages and independently verify their source.
-2. In https://github.com/fLex0id/teleport/releases create a draft
-   release tag `teleport-v18.11.14` (example).
-3. Add these exact **server** package filenames:
-   - `teleport-18.11.14-1.x86_64.rpm`
-   - `teleport_18.11.14_amd64.deb`
-4. Click **Publish release**. The workflow detects the highest published
-   Teleport version, checks asset SHA256 and package metadata, and updates
-   the signed RPM/APT repository. Teleport Connect client packages are ignored.
-5. When the workflow is green, ordinary DNF/APT updates offer that version.
+После однократной настройки обновления выполняются стандартными командами от root, без повторного запуска install-repo.sh.
 
-If a release was published before both server files were uploaded, rerun the
-workflow manually. An unsuccessful job does not deploy a new repository site.
+**Rocky Linux**
 
-## Important operational constraints
+~~~bash
+dnf update -y
+~~~
 
-- Keep old GitHub Releases for rollback. Pages only serves the latest approved
-  server RPM and DEB (around 458 MB total for 18.11.13).
-- Update the Teleport Auth/Proxy cluster **before** SSH agents. A package update
-  is not a guarantee that an already running Teleport process restarted: verify
-  version and service state through an independent SSH connection.
-- Hosts where Teleport is not registered as an RPM/DEB package require a
-  one-time safe conversion to package-managed installation.
-- RPM repo metadata is GPG-signed (`repo_gpgcheck=1`), but individual RPM
-  packages are not re-signed (`gpgcheck=0`); package SHA256 is authenticated
-  through signed repository metadata. APT uses GPG-signed InRelease.
-- GitHub Release asset digests prove integrity against the uploaded file, not
-  independent provenance from Teleport's upstream manufacturer.
-- Protect the publisher account, Actions signing secrets and private GPG key.
-  Key expiry/rotation requires updating each host's trust configuration.
-- GitHub Pages publication and downloads of ~230 MB packages remain subject
-  to GitHub service limits and need real-world smoke testing.
+**Ubuntu / Debian**
 
-Workflow: `.github/workflows/teleport-packages.yml`
-Publisher setup: `setup-publisher.sh`
-Repository builder: `build-repo.sh`
-Host bootstrap: `install-repo.sh`
+~~~bash
+apt update && apt dist-upgrade -y
+~~~
+
+Эти команды обновляют также остальные системные пакеты. Для обновления только Teleport можно использовать dnf upgrade -y teleport или apt install --only-upgrade -y teleport после apt update.
+
+Проверка:
+
+~~~bash
+teleport version
+systemctl status teleport --no-pager
+~~~
+
+Репозиторий предлагает максимальную опубликованную стабильную версию из GitHub Releases после успешной сборки и развёртывания Pages. Например, 19.0.1. Новые версии производителя не загружаются автоматически: их утверждает владелец репозитория.
+
+> Важно: при переходе между основными версиями (например, 18 → 19) проверьте совместимость, требования к обновлению и резервному копированию в документации Teleport. Обновляйте Auth/Proxy до SSH agents. Проверяйте версию реально запущенного процесса: установка пакета не гарантирует перезапуск службы. Teleport должен быть установлен как RPM или DEB; ручная установка бинарника требует отдельной миграции.
+
+## 3. Публикация новой версии
+
+1. Получите оригинальные пакеты производителя и независимо проверьте их происхождение и контрольные суммы.
+2. Создайте draft release в [GitHub Releases](https://github.com/fLex0id/teleport/releases/new).
+3. Укажите тег, например 19.0.1 (также поддерживаются v19.0.1 и teleport-v19.0.1; не дублируйте одну версию разными тегами).
+4. Загрузите обязательные серверные пакеты:
+   - `teleport-19.0.1-1.x86_64.rpm`
+   - `teleport_19.0.1_amd64.deb`
+5. Нажмите **Publish release**. Дополнительные пакеты Teleport Connect и Windows installers могут храниться в Releases, но не включаются в APT/RPM индексы.
+6. Проверьте успешное завершение workflow **Publish approved Teleport package repositories** и развёртывание Pages.
+
+GitHub Actions выбирает максимальную стабильную версию по числовым компонентам, проверяет SHA256 вложений и метаданные RPM/DEB, формирует индексы, подписывает их и публикует на GitHub Pages. При ошибке сборки новый сайт не развёртывается. Если релиз опубликован до загрузки всех пакетов, запустите workflow вручную.
+
+Текущая опубликованная версия Pages: [current-release.txt](https://flex0id.github.io/teleport/current-release.txt).
+
+## 4. Первичная настройка публикации (только владелец)
+
+На доверенной Linux-машине с установленными gh и gpg под обычным пользователем:
+
+~~~bash
+gh auth login
+curl -4fsSL https://raw.githubusercontent.com/fLex0id/teleport/main/setup-publisher.sh -o /tmp/setup-publisher.sh
+less /tmp/setup-publisher.sh
+bash /tmp/setup-publisher.sh
+~~~
+
+Скрипт использует существующий ключ из ~/.gnupg-teleport-repo/ либо создаёт новый, если ключ отсутствует. При миграции предпочтительно сохранить прежний ключ. Не создавайте новый ключ случайно на другой машине. Сохраните fingerprint и защищённую офлайн-копию ключа.
+
+Настраиваются Actions Secrets:
+
+- TELEPORT_REPO_GPG_PRIVATE_KEY
+- TELEPORT_REPO_GPG_PASSPHRASE
+
+Если автоматическое включение Pages не удалось: Settings → Pages → Build and deployment → Source → GitHub Actions.
+
+После настройки secrets и публикации релиза запустите [workflow](https://github.com/fLex0id/teleport/actions/workflows/teleport-packages.yml) вручную через Run workflow (main).
+
+## 5. Адреса и диагностика
+
+| Ресурс | URL |
+|---|---|
+| APT | https://flex0id.github.io/teleport/apt/ |
+| RPM | https://flex0id.github.io/teleport/rpm/x86_64/ |
+| APT InRelease | https://flex0id.github.io/teleport/apt/dists/stable/InRelease |
+| RPM repomd.xml | https://flex0id.github.io/teleport/rpm/x86_64/repodata/repomd.xml |
+| Public key | https://flex0id.github.io/teleport/teleport-repo.asc |
+
+При недоступности Pages или ошибке подписи не отключайте проверку GPG. Проверьте Actions, доступность Pages и доверенный fingerprint. Старые релизы сохраняются для ручного отката; Pages индексирует только последнюю утверждённую версию.
+
+RPM: подписаны метаданные репозитория (repo_gpgcheck=1), отдельные RPM не переподписываются (gpgcheck=0); контрольные суммы пакетов защищены подписанными метаданными. APT: подписан InRelease. SHA256 вложений GitHub подтверждает целостность загрузки, но не заменяет проверку происхождения пакета производителя. Не публикуйте секретный ключ. Учитывайте срок действия ключа и ограничения GitHub Pages.
+
+## 6. Структура проекта
+
+| Файл | Назначение |
+|---|---|
+| [install-repo.sh](install-repo.sh) | Однократное подключение Linux-сервера |
+| [setup-publisher.sh](setup-publisher.sh) | Настройка ключа и публикации |
+| [build-repo.sh](build-repo.sh) | Проверка пакетов, сборка и подпись индексов |
+| [teleport-packages.yml](.github/workflows/teleport-packages.yml) | CI/CD и развёртывание GitHub Pages |
