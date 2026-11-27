@@ -47,7 +47,8 @@ if not valid:
 _, r = max(valid, key=lambda item: item[0])
 tag = r['tag_name']
 version = tag.removeprefix('teleport-v').removeprefix('v')
-expected = [f'teleport-{version}-1.x86_64.rpm', f'teleport_{version}_amd64.deb']
+expected = [f'teleport-{version}-1.x86_64.rpm', f'teleport_{version}_amd64.deb',
+            f'teleport-connect-{version}.x86_64.rpm', f'teleport-connect_{version}_amd64.deb']
 by_name = {}
 for a in r['assets']:
     by_name.setdefault(a['name'], []).append(a)
@@ -61,7 +62,7 @@ for filename in expected:
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest) or asset.get('state') != 'uploaded' or asset.get('size', 0) < 1024:
         sys.exit(f'Invalid digest / upload state for {filename}')
     lines.append(f"{digest.split(':', 1)[1]}  {filename}")
-Path(sys.argv[2]).write_text(f'{tag}\n{version}\n{expected[0]}\n{expected[1]}\n')
+Path(sys.argv[2]).write_text('\n'.join([tag, version, *expected]) + '\n')
 Path(sys.argv[3]).write_text('\n'.join(lines) + '\n')
 print(f'Selected published release: {tag}')
 PY
@@ -70,28 +71,34 @@ tag="${release_info[0]}"
 version="${release_info[1]}"
 rpm_name="${release_info[2]}"
 deb_name="${release_info[3]}"
+connect_rpm_name="${release_info[4]}"
+connect_deb_name="${release_info[5]}"
 
 # Re-runs and older release events cannot silently downgrade the repository:
 # always select the highest published X.Y.Z / vX.Y.Z / teleport-vX.Y.Z tag.
 gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-    --pattern "$rpm_name" --pattern "$deb_name" --dir "$work/downloads"
+    --pattern "$rpm_name" --pattern "$deb_name" \
+    --pattern "$connect_rpm_name" --pattern "$connect_deb_name" --dir "$work/downloads"
 (cd "$work/downloads" && sha256sum --check "$work/sha256.txt")
-
-rpm_file="$work/downloads/$rpm_name"
-deb_file="$work/downloads/$deb_name"
-[[ "$(rpm -qp --qf '%{NAME}' "$rpm_file")" == teleport ]]
-[[ "$(rpm -qp --qf '%{VERSION}' "$rpm_file")" == "$version" ]]
-[[ "$(rpm -qp --qf '%{ARCH}' "$rpm_file")" == x86_64 ]]
-[[ "$(dpkg-deb -f "$deb_file" Package)" == teleport ]]
-[[ "$(dpkg-deb -f "$deb_file" Version)" == "$version" ]]
-[[ "$(dpkg-deb -f "$deb_file" Architecture)" == amd64 ]]
 
 rpm_dir="$out/rpm/x86_64"
 apt_dir="$out/apt"
 mkdir -p "$rpm_dir" "$apt_dir/pool/main" "$apt_dir/dists/stable/main/binary-amd64"
-cp -- "$rpm_file" "$rpm_dir/"
-cp -- "$deb_file" "$apt_dir/pool/main/"
-chmod 644 "$rpm_dir/$rpm_name" "$apt_dir/pool/main/$deb_name"
+
+validate_and_copy() {
+    local package="$1" rpm_name="$2" deb_name="$3"
+    local rpm_file="$work/downloads/$rpm_name" deb_file="$work/downloads/$deb_name"
+    [[ "$(rpm -qp --qf '%{NAME}' "$rpm_file")" == "$package" ]]
+    [[ "$(rpm -qp --qf '%{VERSION}' "$rpm_file")" == "$version" ]]
+    [[ "$(rpm -qp --qf '%{ARCH}' "$rpm_file")" == x86_64 ]]
+    [[ "$(dpkg-deb -f "$deb_file" Package)" == "$package" ]]
+    [[ "$(dpkg-deb -f "$deb_file" Version)" == "$version" ]]
+    [[ "$(dpkg-deb -f "$deb_file" Architecture)" == amd64 ]]
+    install -m 0644 "$rpm_file" "$rpm_dir/$rpm_name"
+    install -m 0644 "$deb_file" "$apt_dir/pool/main/$deb_name"
+}
+validate_and_copy teleport "$rpm_name" "$deb_name"
+validate_and_copy teleport-connect "$connect_rpm_name" "$connect_deb_name"
 
 createrepo_c --quiet "$rpm_dir"
 (
@@ -127,7 +134,7 @@ cat > "$out/index.html" <<HTML
 <!doctype html><html lang="en"><meta charset="utf-8"><title>Teleport packages</title>
 <h1>fLex0id Teleport package repository</h1>
 <p>Currently published release: <strong>${tag}</strong></p>
-<p>Only the Teleport server package is indexed (no Teleport Connect).</p>
+<p>Teleport Server and Teleport Connect are indexed for Linux x86_64 / amd64.</p>
 <p>Signed metadata: <a href="apt/dists/stable/InRelease">APT InRelease</a>,
 <a href="rpm/x86_64/repodata/repomd.xml">RPM repomd.xml</a>.</p>
 <p><a href="teleport-repo.asc">Public signing key</a> and
