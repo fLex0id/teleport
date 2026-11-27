@@ -3,6 +3,7 @@
 # Requires a fingerprint recorded independently of the remote repository.
 set -Eeuo pipefail
 umask 077
+trap 'rc=$?; printf "[ERROR] Repository setup failed at line %s (exit %s).\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
 
 [[ "$(id -u)" -eq 0 ]] || { echo 'Run this as root' >&2; exit 1; }
 base='https://flex0id.github.io/teleport'
@@ -12,22 +13,35 @@ expected="${expected^^}"
     echo 'Set TELEPORT_REPO_EXPECTED_FPR to the independently verified 40-character GPG fingerprint' >&2
     exit 1
 }
-command -v curl >/dev/null
-command -v gpg >/dev/null
-command -v awk >/dev/null
+echo '[INFO] Checking repository setup prerequisites...'
+for tool in curl gpg awk python3; do
+    command -v "$tool" >/dev/null || {
+        echo "[ERROR] Required command missing: $tool" >&2
+        if command -v dnf >/dev/null; then
+            echo 'Install prerequisites: dnf install -y gnupg2 python3 gawk ca-certificates (curl or curl-minimal is also required).' >&2
+        else
+            echo 'Install prerequisites: apt-get install -y curl gnupg python3 gawk ca-certificates' >&2
+        fi
+        exit 1
+    }
+done
 arch="$(uname -m)"
 tmp="$(mktemp -d)"
 export GNUPGHOME="$tmp/gnupg"
 mkdir -m 700 "$GNUPGHOME"
 trap 'rm -rf -- "$tmp"' EXIT
+echo '[INFO] Downloading repository signing key...'
 curl -4fsSL --retry 3 --connect-timeout 10 --max-time 60 \
     "$base/teleport-repo.asc" -o "$tmp/key.asc"
-actual="$(gpg --batch --show-keys --with-colons "$tmp/key.asc" 2>/dev/null | awk -F: '$1=="fpr"{print toupper($10); exit}')"
-[[ "$(gpg --batch --show-keys --with-colons "$tmp/key.asc" | awk -F: '$1=="pub"{n++} END{print n+0}')" == 1 ]]
+echo '[INFO] Checking signing key fingerprint...'
+gpg --batch --show-keys --with-colons "$tmp/key.asc" >"$tmp/key-info" || { echo '[ERROR] Invalid or unreadable repository signing key' >&2; exit 1; }
+actual="$(awk -F: '$1=="fpr" && !found {print toupper($10); found=1}' "$tmp/key-info")"
+[[ "$(awk -F: '$1=="pub"{n++} END{print n+0}' "$tmp/key-info")" == 1 ]] || { echo '[ERROR] Expected exactly one public signing key' >&2; exit 1; }
 [[ "$actual" == "$expected" ]] || { echo "Refusing signing-key mismatch: got $actual" >&2; exit 1; }
 
 if command -v dnf >/dev/null && [[ -f /etc/redhat-release ]]; then
     [[ "$arch" == x86_64 ]] || { echo "Unsupported RPM architecture: $arch" >&2; exit 1; }
+    echo '[INFO] Verifying signed RPM metadata...'
     curl -4fsSL --retry 3 "$base/rpm/x86_64/repodata/repomd.xml" -o "$tmp/repomd.xml"
     curl -4fsSL --retry 3 "$base/rpm/x86_64/repodata/repomd.xml.asc" -o "$tmp/repomd.xml.asc"
     gpg --no-default-keyring --keyring "$tmp/check.gpg" --import "$tmp/key.asc" >/dev/null 2>&1
@@ -84,6 +98,7 @@ PYRPM
     dnf repoquery --disablerepo='*' --enablerepo='flex0id-teleport' --available teleport teleport-connect || true
 elif command -v apt-get >/dev/null && [[ -f /etc/debian_version ]]; then
     [[ "$arch" == x86_64 ]] || { echo "Unsupported APT architecture: $arch" >&2; exit 1; }
+    echo '[INFO] Verifying signed APT metadata...'
     curl -4fsSL --retry 3 "$base/apt/dists/stable/InRelease" -o "$tmp/InRelease"
     gpg --no-default-keyring --keyring "$tmp/check.gpg" --import "$tmp/key.asc" >/dev/null 2>&1
     gpg --no-default-keyring --keyring "$tmp/check.gpg" --verify "$tmp/InRelease"
