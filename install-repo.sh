@@ -13,19 +13,53 @@ expected="${expected^^}"
     echo 'Set TELEPORT_REPO_EXPECTED_FPR to the independently verified 40-character GPG fingerprint' >&2
     exit 1
 }
-echo '[INFO] Checking repository setup prerequisites...'
-for tool in curl gpg awk python3; do
-    command -v "$tool" >/dev/null || {
-        echo "[ERROR] Required command missing: $tool" >&2
-        if command -v dnf >/dev/null; then
-            echo 'Install prerequisites: dnf install -y gnupg2 python3 gawk ca-certificates (curl or curl-minimal is also required).' >&2
-        else
-            echo 'Install prerequisites: apt-get install -y curl gnupg python3 gawk ca-certificates' >&2
-        fi
-        exit 1
-    }
-done
 arch="$(uname -m)"
+[[ "$arch" == x86_64 ]] || { echo "[ERROR] Unsupported architecture: $arch" >&2; exit 1; }
+if command -v dnf >/dev/null && [[ -f /etc/redhat-release ]]; then
+    pm=dnf
+elif command -v apt-get >/dev/null && [[ -f /etc/debian_version ]]; then
+    pm=apt
+else
+    echo '[ERROR] Unsupported Linux distribution or package manager' >&2
+    exit 1
+fi
+
+echo '[INFO] Checking repository setup prerequisites...'
+missing=()
+command -v curl >/dev/null || missing+=(curl)
+if ! command -v gpg >/dev/null; then
+    if [[ "$pm" == dnf ]]; then missing+=(gnupg2); else missing+=(gnupg); fi
+fi
+command -v awk >/dev/null || missing+=(gawk)
+command -v python3 >/dev/null || missing+=(python3)
+if [[ "$pm" == dnf ]]; then
+    rpm -q ca-certificates >/dev/null 2>&1 || missing+=(ca-certificates)
+else
+    [[ "$(dpkg-query -W -f='${db:Status-Status}' ca-certificates 2>/dev/null || :)" == installed ]] || missing+=(ca-certificates)
+fi
+if (( ${#missing[@]} > 0 )); then
+    echo "[INFO] Installing missing prerequisites: ${missing[*]}"
+    if [[ "$pm" == dnf ]]; then
+        dnf -y --disablerepo=flex0id-teleport install "${missing[@]}" || {
+            echo '[ERROR] Cannot install prerequisites from system repositories. Check DNS and DNF repositories.' >&2
+            exit 1
+        }
+    else
+        # Refresh only after a failed attempt, so stale third-party sources
+        # do not unnecessarily prevent installing already indexed packages.
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "${missing[@]}"; then
+            apt-get -o DPkg::Lock::Timeout=120 update &&
+                DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "${missing[@]}" || {
+                echo '[ERROR] Cannot install prerequisites from system repositories. Check DNS and APT repositories.' >&2
+                exit 1
+            }
+        fi
+    fi
+fi
+for tool in curl gpg awk python3; do
+    command -v "$tool" >/dev/null || { echo "[ERROR] Required command still missing: $tool" >&2; exit 1; }
+done
+echo '[OK] Repository setup prerequisites available.'
 tmp="$(mktemp -d)"
 export GNUPGHOME="$tmp/gnupg"
 mkdir -m 700 "$GNUPGHOME"
@@ -187,7 +221,7 @@ for path, updated in edits:
     print(f"Disabled competing official Teleport APT source: {path}")
 PY
     echo 'APT repository installed. Verification:'
-    apt-get update
+    apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any update
     apt-cache policy teleport teleport-connect
 else
     echo 'Unsupported Linux distribution or package manager' >&2
