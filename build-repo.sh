@@ -28,7 +28,7 @@ if (( ${#fingerprints[@]} != 1 )); then
 fi
 fingerprint="${fingerprints[0]}"
 
-echo 'Discovering the highest published teleport-vX.Y.Z release ...'
+echo 'Discovering the highest published X.Y.Z / vX.Y.Z / teleport-vX.Y.Z release ...'
 gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$work/releases.json"
 python3 - "$work/releases.json" "$work/release.env" "$work/sha256.txt" <<'PY'
 import json, re, sys
@@ -39,14 +39,14 @@ releases = [r for batch in raw for r in (batch if isinstance(batch, list) else [
 valid = []
 for r in releases:
     tag = r.get('tag_name', '')
-    m = re.fullmatch(r'teleport-v(\d+)\.(\d+)\.(\d+)', tag)
+    m = re.fullmatch(r'(?:teleport-v|v)?(\d+)\.(\d+)\.(\d+)', tag)
     if m and not r.get('draft') and not r.get('prerelease') and r.get('published_at'):
         valid.append((tuple(map(int, m.groups())), r))
 if not valid:
     sys.exit('No published Teleport release found')
 _, r = max(valid, key=lambda item: item[0])
 tag = r['tag_name']
-version = tag.removeprefix('teleport-v')
+version = tag.removeprefix('teleport-v').removeprefix('v')
 expected = [f'teleport-{version}-1.x86_64.rpm', f'teleport_{version}_amd64.deb']
 by_name = {}
 for a in r['assets']:
@@ -72,7 +72,7 @@ rpm_name="${release_info[2]}"
 deb_name="${release_info[3]}"
 
 # Re-runs and older release events cannot silently downgrade the repository:
-# always select the highest published teleport-vX.Y.Z tag.
+# always select the highest published X.Y.Z / vX.Y.Z / teleport-vX.Y.Z tag.
 gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
     --pattern "$rpm_name" --pattern "$deb_name" --dir "$work/downloads"
 (cd "$work/downloads" && sha256sum --check "$work/sha256.txt")
