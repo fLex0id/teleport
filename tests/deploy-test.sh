@@ -49,4 +49,59 @@ CONF=$scratch/existing.yaml
 touch "$CONF"
 if existing_guard; then exit 1; fi
 ok 'existing configuration protected'
+# Mock network calls; no live DNS, root privileges or host modifications.
+calls=$scratch/calls
+TMP=$scratch
+MODE=normal
+curl(){
+  printf '%s\n' "$*" >>"$calls"
+  case "$MODE" in
+    normal) return 0;;
+    tls) return 60;;
+    dns)
+      case "$*" in *--resolve*185.199.109.153*) return 0;; *--resolve*) return 7;; *) return 6;; esac;;
+    dead) case "$*" in *--resolve*) return 7;; *) return 6;; esac;;
+    dynamic) case "$*" in *--resolve*192.0.2.10*) return 0;; *--resolve*) return 7;; *) return 6;; esac;;
+  esac
+}
+dig(){ if [[ $MODE == dynamic ]]; then printf '%s\n' 'not-an-ip' '192.0.2.10'; fi; }
+: >"$calls"
+repo_probe
+[[ -z $REPO_FALLBACK_IP && $(wc -l <"$calls") == 1 ]]
+! grep -q -- --resolve "$calls"
+ok 'normal DNS never uses fallback'
+: >"$calls"; MODE=tls
+if repo_probe; then exit 1; fi
+[[ -z $REPO_FALLBACK_IP && $(wc -l <"$calls") == 1 ]]
+ok 'TLS errors never trigger fallback'
+: >"$calls"; MODE=dns
+repo_probe
+[[ $REPO_FALLBACK_IP == 185.199.109.153 ]]
+grep -q -- '185.199.108.153' "$calls"
+ok 'DNS failure tries another documented Pages address'
+repo_fetch "$BASE/install-repo.sh" "$scratch/download"
+grep -q -- "--resolve $REPO_HOST:443:185.199.109.153" "$calls"
+ok 'fallback applies only to repository fetch'
+if repo_fetch 'https://example.com/file' "$scratch/download"; then exit 1; fi
+ok 'fallback rejects unrelated domains'
+MODE=dead
+if repo_probe; then exit 1; fi
+[[ -z $REPO_FALLBACK_IP ]]
+ok 'all failed addresses stop safely'
+MODE=dynamic
+repo_probe
+[[ $REPO_FALLBACK_IP == 192.0.2.10 ]]
+ok 'alternate DNS result tried before static addresses'
+MODE=normal
+repo_probe
+[[ -z $REPO_FALLBACK_IP ]]
+ok 'normal DNS recovery clears fallback'
+repo_run true
+if repo_run false; then exit 1; fi
+ok 'normal package execution preserves command result'
+# The DNS menu never calls repo_probe/repo_fetch and DNS tests remain real NSS tests.
+declare -f dns_change dns_test dns_restore >"$scratch/dns-functions"
+if grep -Eq 'repo_probe|repo_fetch|repo_run|--resolve' "$scratch/dns-functions"; then exit 1; fi
+ok 'DNS management is independent of repository fallback'
+
 printf '%s tests passed\n' "$count"
