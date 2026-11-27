@@ -4,6 +4,12 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - deploy-teleport.sh
+      - build-repo.sh
+      - .github/workflows/teleport-packages.yml
 
 permissions:
   contents: read
