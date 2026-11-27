@@ -434,11 +434,70 @@ ssh_ports(){
     systemctl show "$u" -p Listen --value | grep -oE ':[0-9]+ \(Stream\)|^[0-9]+ \(Stream\)' | grep -oE '[0-9]+' || :
   done
 }
+# Snapshot UFW rules before modifying simple port entries; refuse unsafe restore.
+ufw_rows(){
+  ufw status numbered | awk -v p="$1" '
+    /^\[[[:space:]]*[0-9]+\]/ {
+      s=$0; sub(/^\[[[:space:]]*/, "", s); n=s; sub(/\].*$/, "", n)
+      sub(/^[^]]+\][[:space:]]*/, "", s)
+      split(s,a,/[[:space:]]+/)
+      if(a[1]==p"/tcp" || a[1]==p) {
+        if(a[2]=="(v6)") {family=6; action=a[3]; rest=4}
+        else {family=4; action=a[2]; rest=3}
+        if(a[rest]=="IN") rest++
+        if(a[rest]=="Anywhere" && (a[rest+1]=="" || a[rest+1]=="(v6)") && a[rest+2]=="")
+          print n, family, action, a[1]
+      }
+    }'
+}
+ufw_close_port(){
+  local port=$1 rows n family action spec first4 first6 status
+  rows=$(ufw_rows "$port") || return 1
+  while read -r n family action spec; do
+    [[ -n $n ]] || continue
+    case "$action" in ALLOW|LIMIT) ufw --force delete "$n" || return 1;; esac
+  done < <(printf '%s\n' "$rows" | sort -rn)
+  rows=$(ufw_rows "$port") || return 1
+  first4=$(awk '$2==4{print $3;exit}' <<<"$rows")
+  first6=$(awk '$2==6{print $3;exit}' <<<"$rows")
+  if [[ $first4 != DENY && $first4 != REJECT ]]; then
+    status=$(ufw status numbered) || return 1
+    if grep -Eq '^\[[[:space:]]*[0-9]+\]' <<<"$status"; then
+      ufw insert 1 deny in proto tcp to any port "$port" || return 1
+    else
+      ufw deny in proto tcp to any port "$port" || return 1
+    fi
+  fi
+  rows=$(ufw_rows "$port") || return 1
+  first4=$(awk '$2==4{print $3;exit}' <<<"$rows")
+  first6=$(awk '$2==6{print $3;exit}' <<<"$rows")
+  [[ $first4 == DENY || $first4 == REJECT ]] || { fail "UFW did not block TCP $port (IPv4)."; return 1; }
+  if grep -Eq '^[[:space:]]*IPV6=yes' /etc/default/ufw; then
+    [[ $first6 == DENY || $first6 == REJECT ]] || { fail "UFW did not block TCP $port (IPv6)."; return 1; }
+  fi
+  say "[OK] UFW deny/reject verified for TCP $port."
+}
+ufw_snapshot(){
+  local backup=$1
+  cp -a /etc/ufw/user.rules "$backup/user.rules" || return 1
+  cp -a /etc/ufw/user6.rules "$backup/user6.rules" || return 1
+  sha256sum /etc/ufw/user.rules /etc/ufw/user6.rules >"$backup/ufw.before" || return 1
+}
+ufw_restore_snapshot(){
+  local backup=$1
+  [[ -f $backup/ufw.before ]] || return 0
+  if [[ -f $backup/ufw.after ]] && ! sha256sum -c "$backup/ufw.after" >/dev/null 2>&1; then
+    fail "UFW changed since lockdown; refusing to overwrite administrator changes. Backup: $backup"
+    return 1
+  fi
+  cp -a "$backup/user.rules" /etc/ufw/user.rules && cp -a "$backup/user6.rules" /etc/ufw/user6.rules && ufw reload
+}
 ssh_restore(){
   local backup u enabled active kind zone port scope
   backup=$(ssh_state)
   [[ -f $backup/units ]] || { say 'No OpenSSH changes saved by this installer.'; return 0; }
   local failed=0
+  ufw_restore_snapshot "$backup" || failed=1
   # Restore only rules removed by us, never reload or reset the firewall.
   if [[ -f $backup/firewall ]]; then
     while read -r kind zone port scope; do
@@ -553,15 +612,11 @@ ssh_lockdown(){
     done
     say 'OpenSSH reject rules added to firewalld zones; higher-priority custom rules may override them.'
   elif command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+    ufw_snapshot "$backup" || return 1
     for port in "${ports[@]}"; do
-      # Do not adopt an existing deny rule that may belong to the administrator.
-      if ufw status | grep -Eq "^$port/tcp[[:space:]]+DENY[[:space:]]+IN"; then
-        say "Existing UFW deny on $port; preserved."
-        continue
-      fi
-      ufw insert 1 deny in proto tcp to any port "$port" || return 1
-      printf 'ufw - %s -\n' "$port" >>"$backup/firewall" || return 1
+      ufw_close_port "$port" || return 1
     done
+    sha256sum /etc/ufw/user.rules /etc/ufw/user6.rules >"$backup/ufw.after" || return 1
   else
     say 'No supported active firewalld/UFW detected; OpenSSH listeners are disabled, but firewall rules were not changed.'
     say 'Existing nftables/iptables and provider firewall remain unchanged.'
