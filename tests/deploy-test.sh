@@ -120,7 +120,7 @@ SSH_PENDING=0
 ssh_ready(){ return 0; }
 ssh_units(){ printf '%s\n' ssh.socket ssh.service; }
 ssh_ports(){ printf '%s\n' 22 2222; }
-yesno(){ return 0; }
+ask(){ ANSWER=y; }
 ss(){ :; }
 systemctl(){
   printf '%s\n' "$*" >>"$scratch/systemctl"
