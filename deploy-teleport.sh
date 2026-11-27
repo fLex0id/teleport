@@ -71,7 +71,7 @@ dns_change(){
   say '1 Quad9   2 Cloudflare   3 Google   4 Cisco OpenDNS'
   say '5 NextDNS (DoH profile)   6 AdGuard   7 Custom UDP   0 Keep current'
   choice 'DNS provider [0]:' 0 7
-  local p=$ANSWER ips host path=/dns-query mode ip stamp names='' i=0 bin default_route
+  local p=$ANSWER ips host path=/dns-query mode ip stamp names='' i=0 bin
   case "$p" in
     0) return 0;;
     1) ips='9.9.9.9 149.112.112.112'; host=dns.quad9.net;;
@@ -95,7 +95,13 @@ dns_change(){
   if [[ $mode == 2 ]]; then
     if ! command -v dnscrypt-proxy >/dev/null; then
       if [[ $PM == apt ]]; then run 'Install DNSCrypt proxy' apt-get install -y dnscrypt-proxy || return 1
-      else run 'Install DNSCrypt proxy (requires an enabled trusted repository, e.g. EPEL)' dnf -y install dnscrypt-proxy || { say 'DoH unavailable; current system DNS unchanged.'; return 1; }; fi
+      else
+        if ! run 'Install DNSCrypt proxy' dnf -y install dnscrypt-proxy; then
+          if [[ $ID == rocky || $ID == almalinux ]] && yesno 'Enable EPEL to install DNSCrypt proxy?'; then
+            run 'Install EPEL' dnf -y install epel-release && run 'Install DNSCrypt proxy' dnf -y install dnscrypt-proxy || return 1
+          else say 'DoH unavailable; current DNS unchanged.'; return 1; fi
+        fi
+      fi
     fi
     bin=$(command -v dnscrypt-proxy) || return 1
   fi
@@ -141,14 +147,14 @@ EOF
   fi
   if systemctl is-active --quiet NetworkManager; then
     touch "$DNSBACK/nm"
-    mkdir -p /etc/NetworkManager/conf.d
-    printf '[main]\ndns=none\n' >"$NMCONF"
+    mkdir -p /etc/NetworkManager/conf.d || return 1
+    printf '[main]\ndns=none\n' >"$NMCONF" || return 1
     systemctl reload NetworkManager || return 1
   fi
   # Detach from systemd-resolved stub; do not stop other network services.
-  local tmp; tmp=$(mktemp /etc/.teleport-resolv.XXXXXX)
+  local tmp; tmp=$(mktemp /etc/.teleport-resolv.XXXXXX) || return 1
   { say '# Managed by deploy-teleport.sh'; for ip in $ips; do say "nameserver $ip"; done; say 'options timeout:2 attempts:2'; } >"$tmp"
-  chmod 644 "$tmp"; mv -Tf "$tmp" /etc/resolv.conf
+  chmod 644 "$tmp" && mv -Tf "$tmp" /etc/resolv.conf || return 1
   if command -v restorecon >/dev/null; then restorecon /etc/resolv.conf || :; fi
   if dns_test; then DNS_PENDING=0; say '[OK] DNS configured. Use menu 4 to restore.'; else dns_restore || :; DNS_PENDING=0; return 1; fi
 }
@@ -156,7 +162,9 @@ install_package(){
   fetch https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh "$TMP/install-repo.sh" || return 1
   run 'Configure signed Teleport repository' env TELEPORT_REPO_EXPECTED_FPR="$FPR" bash "$TMP/install-repo.sh" || return 1
   if [[ $PM == apt ]]; then
-    local version; version=$(apt-cache policy teleport | awk '/Candidate:/{print $2}')
+    local version; version=$(curl -4fsSL --max-time 30 "$BASE/current-release.txt") || return 1
+    version=$(printf '%s' "$version" | sed -E 's/^(teleport-v|v)//')
+    apt-cache madison teleport | awk -F'|' -v v="$version" '$2 ~ "^[[:space:]]*" v "[[:space:]]*$" && $3 ~ /https:\/\/flex0id.github.io\/teleport\/apt/ {found=1} END{exit !found}' || return 1
     [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail 'No valid package candidate'; return 1; }
     run "Install Teleport $version" env DEBIAN_FRONTEND=noninteractive apt-get install -y "teleport=$version"
   else
@@ -220,7 +228,7 @@ main_install(){
   if [[ $mode == 1 ]]; then args+=(--acme --acme-email="$email"); else args+=(--cert-file="$cert" --key-file="$key"); fi
   teleport "${args[@]}" >"$TMP/cluster.yaml" || return 1
   # Use PyYAML from the distribution to edit structured configuration.
-  python3 - "$TMP/cluster.yaml" "$node" <<'PY'
+  python3 - "$TMP/cluster.yaml" "$node" <<'PY' || return 1
 import sys,yaml
 p,node=sys.argv[1:]
 with open(p) as f: c=yaml.safe_load(f)
@@ -231,7 +239,8 @@ c.setdefault('ssh_service',{})['listen_addr']='127.0.0.1:3022'
 with open(p,'w') as f: yaml.safe_dump(c,f,sort_keys=False)
 PY
   [[ ! -e $CONF ]] || { fail 'Package created a configuration; inspect manually.'; return 1; }
-  install -m 0600 "$TMP/cluster.yaml" "$CONF"
+  teleport configure --test="$TMP/cluster.yaml" || return 1
+  install -m 0600 "$TMP/cluster.yaml" "$CONF" || return 1
   if command -v restorecon >/dev/null; then restorecon "$CONF" || :; fi
   open_https || return 1
   run 'Enable Teleport' systemctl enable --now teleport || return 1
@@ -250,13 +259,13 @@ agent_install(){
   while :; do IFS= read -r -s -p 'Join token: ' token </dev/tty || return 1; echo; [[ $token =~ ^[A-Za-z0-9_-]{16,256}$ ]] && break; say 'Invalid token, try again.'; done
   yesno "Join $proxy as $node?" || return 0
   install_package || return 1
-  printf '%s' "$token" >"$TMP/join-token"; unset token
-  install -d -m 0700 /etc/teleport
+  printf '%s' "$token" >"$TMP/join-token" || return 1; unset token
+  install -d -m 0700 /etc/teleport || return 1
   [[ ! -e /etc/teleport/join-token ]] || return 1
-  install -m 0600 "$TMP/join-token" /etc/teleport/join-token
+  install -m 0600 "$TMP/join-token" /etc/teleport/join-token || return 1
   rm -f "$TMP/join-token"
   teleport node configure --output="file://$TMP/agent.yaml" --proxy="$proxy:443" --token=/etc/teleport/join-token >/dev/null || return 1
-  python3 - "$TMP/agent.yaml" "$node" <<'PY'
+  python3 - "$TMP/agent.yaml" "$node" <<'PY' || return 1
 import sys,yaml
 p,node=sys.argv[1:]
 with open(p) as f:c=yaml.safe_load(f)
@@ -264,13 +273,14 @@ c.setdefault('teleport',{})['nodename']=node
 with open(p,'w') as f:yaml.safe_dump(c,f,sort_keys=False)
 PY
   [[ ! -e $CONF ]] || return 1
-  install -m 0600 "$TMP/agent.yaml" "$CONF"
+  teleport configure --test="$TMP/agent.yaml" || return 1
+  install -m 0600 "$TMP/agent.yaml" "$CONF" || return 1
   if command -v restorecon >/dev/null; then restorecon "$CONF" /etc/teleport/join-token || :; fi
   run 'Enable Teleport agent' systemctl enable --now teleport || return 1
   sleep 5
   systemctl is-active --quiet teleport || { fail 'Agent not running; inspect journalctl -u teleport.'; return 1; }
   printf '%s\n' agent >"$STATE/role"
-  say 'Agent process is running. Confirm actual enrollment on the main server with: tctl nodes ls'
+  say 'Agent process is running (not yet proof of enrollment). Confirm actual enrollment on the main server with: tctl nodes ls'
   say 'No inbound SSH port has been opened.'
 }
 cleanup(){ local rc=$?; if [[ ${DNS_PENDING:-0} == 1 ]]; then dns_restore || :; fi; [[ -z ${TMP:-} ]] || rm -rf "$TMP"; exit "$rc"; }
@@ -278,6 +288,7 @@ main(){
   [[ $EUID == 0 ]] || { say 'Run as root (sudo bash tp.sh).'; exit 1; }
   [[ -r /dev/tty ]] || exit 1
   mkdir -p "$STATE"; chmod 700 "$STATE"; touch "$LOG"; chmod 600 "$LOG"
+  command -v flock >/dev/null || { fail "Install util-linux first."; exit 1; }
   exec 9>/run/lock/teleport-deploy.lock; flock -n 9 || { fail 'Installer already running'; exit 1; }
   TMP=$(mktemp -d); DNS_PENDING=0
   trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
