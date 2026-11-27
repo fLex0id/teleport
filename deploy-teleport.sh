@@ -432,12 +432,17 @@ ssh_restore(){
           if [[ $port == service:ssh ]]; then firewall-cmd "${opts[@]}" --add-service=ssh || failed=1
           else firewall-cmd "${opts[@]}" --add-port="$port/tcp" || failed=1; fi;;
         ufw) ufw delete deny in proto tcp to any port "$port" || failed=1;;
-        nft) nft delete table inet teleport_ssh_lockdown 2>/dev/null || { nft list table inet teleport_ssh_lockdown >/dev/null 2>&1 && failed=1 || :; };;
+        rich)
+          local -a opts=("--zone=$zone")
+          [[ $scope != permanent ]] || opts+=(--permanent)
+          local rule="rule priority=\"-100\" port port=\"$port\" protocol=\"tcp\" reject"
+          if firewall-cmd "${opts[@]}" --query-rich-rule="$rule" >/dev/null 2>&1; then firewall-cmd "${opts[@]}" --remove-rich-rule="$rule" || failed=1; fi;;
       esac
     done <"$backup/firewall"
   fi
   # Restore enablement first, then the original running state.
   while read -r u enabled active; do
+    if [[ $(systemctl is-enabled "$u" 2>/dev/null || :) == masked ]]; then systemctl unmask "$u" || failed=1; fi
     case "$enabled" in
       enabled) systemctl enable "$u" || failed=1;;
       enabled-runtime) systemctl enable --runtime "$u" || failed=1;;
@@ -488,7 +493,7 @@ ssh_lockdown(){
   done
   yesno 'Disable OpenSSH and close these ports?' || return 0
   mkdir -m 700 "$backup" || return 1
-  : >"$backup/units"; : >"$backup/firewall"
+  : >"$backup/units" && : >"$backup/firewall" || return 1
   for u in "${units[@]}"; do
     enabled=$(systemctl is-enabled "$u" 2>/dev/null || :)
     active=$(systemctl is-active "$u" 2>/dev/null || :)
@@ -500,10 +505,9 @@ ssh_lockdown(){
   for u in "${units[@]}"; do
     systemctl stop "$u" || return 1
     case "$(systemctl is-enabled "$u" 2>/dev/null || :)" in enabled|enabled-runtime) systemctl disable "$u" || return 1;; esac
+    systemctl mask "$u" || return 1
   done
-  # Remove firewalld SSH allowances in every active zone, runtime and permanent.
-  # Add an explicit persistent block only when using a dedicated nftables table
-  # or UFW; firewalld rich rules are managed separately below.
+  # Remove explicit SSH allowances and install scoped reject rules.
   if systemctl is-active --quiet firewalld; then
     local -a zones=()
     mapfile -t zones < <(firewall-cmd --get-zones | tr ' ' '\n' | sed '/^$/d')
@@ -513,18 +517,23 @@ ssh_lockdown(){
         [[ $scope != permanent ]] || opts+=(--permanent)
         # The ssh service usually maps to port 22. Preserve unrelated services.
         if [[ " ${ports[*]} " == *" 22 "* ]] && firewall-cmd "${opts[@]}" --query-service=ssh >/dev/null 2>&1; then
-          firewall-cmd "${opts[@]}" --remove-service=ssh || return 1
           printf 'firewalld %s service:ssh %s\n' "$zone" "$scope" >>"$backup/firewall" || return 1
+          firewall-cmd "${opts[@]}" --remove-service=ssh || return 1
         fi
         for port in "${ports[@]}"; do
+          local rule="rule priority=\"-100\" port port=\"$port\" protocol=\"tcp\" reject"
+          if ! firewall-cmd "${opts[@]}" --query-rich-rule="$rule" >/dev/null 2>&1; then
+            printf 'rich %s %s %s\n' "$zone" "$port" "$scope" >>"$backup/firewall" || return 1
+            firewall-cmd "${opts[@]}" --add-rich-rule="$rule" || return 1
+          fi
           if firewall-cmd "${opts[@]}" --query-port="$port/tcp" >/dev/null 2>&1; then
-            firewall-cmd "${opts[@]}" --remove-port="$port/tcp" || return 1
             printf 'firewalld %s %s %s\n' "$zone" "$port" "$scope" >>"$backup/firewall" || return 1
+            firewall-cmd "${opts[@]}" --remove-port="$port/tcp" || return 1
           fi
         done
       done
     done
-    say 'Removed explicit OpenSSH allowances; custom rich rules/policies remain unchanged.'
+    say 'OpenSSH reject rules added to firewalld zones; higher-priority custom rules may override them.'
   elif command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
     for port in "${ports[@]}"; do
       # Do not adopt an existing deny rule that may belong to the administrator.
@@ -536,7 +545,7 @@ ssh_lockdown(){
       printf 'ufw - %s -\n' "$port" >>"$backup/firewall" || return 1
     done
   else
-    say 'No supported active firewalld/UFW detected; OpenSSH listeners are disabled.'
+    say 'No supported active firewalld/UFW detected; OpenSSH listeners are disabled, but firewall rules were not changed.'
     say 'Existing nftables/iptables and provider firewall remain unchanged.'
   fi
   for port in "${ports[@]}"; do
