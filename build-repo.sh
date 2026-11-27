@@ -121,6 +121,7 @@ sign --armor --detach-sign \
 gpg --armor --export "$fingerprint" > "$out/teleport-repo.asc"
 printf '%s\n' "$fingerprint" > "$out/signing-fingerprint.txt"
 printf '%s\n' "$tag" > "$out/current-release.txt"
+install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/LICENSE-TELEPORT" "$out/LICENSE-TELEPORT"
 touch "$out/.nojekyll"
 cat > "$out/index.html" <<HTML
 <!doctype html><html lang="en"><meta charset="utf-8"><title>Teleport packages</title>
@@ -130,7 +131,8 @@ cat > "$out/index.html" <<HTML
 <p>Signed metadata: <a href="apt/dists/stable/InRelease">APT InRelease</a>,
 <a href="rpm/x86_64/repodata/repomd.xml">RPM repomd.xml</a>.</p>
 <p><a href="teleport-repo.asc">Public signing key</a> and
-<a href="signing-fingerprint.txt">its fingerprint</a>.</p></html>
+<a href="signing-fingerprint.txt">its fingerprint</a>.</p>
+<p><a href="LICENSE-TELEPORT">Teleport Community Edition License (reference)</a>.</p></html>
 HTML
 
 # Keep only the latest packages to remain below the 1 GiB Pages deployment limit.
