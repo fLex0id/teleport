@@ -131,6 +131,8 @@ printf '%s\n' "$tag" > "$out/current-release.txt"
 install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/LICENSE-TELEPORT" "$out/LICENSE-TELEPORT"
 bash -n "$(dirname "${BASH_SOURCE[0]}")/deploy-teleport.sh"
 install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/deploy-teleport.sh" "$out/tp.sh"
+bash -n "$(dirname "${BASH_SOURCE[0]}")/install-repo.sh"
+install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/install-repo.sh" "$out/install-repo.sh"
 touch "$out/.nojekyll"
 cat > "$out/index.html" <<HTML
 <!doctype html><html lang="en"><meta charset="utf-8"><title>Teleport packages</title>
