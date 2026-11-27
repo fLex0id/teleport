@@ -11,6 +11,7 @@ on:
       - build-repo.sh
       - install-repo.sh
       - tests/deploy-test.sh
+      - tests/ufw-integration.sh
       - .github/workflows/teleport-packages.yml
 
 permissions:
@@ -37,6 +38,11 @@ jobs:
           bash -n deploy-teleport.sh
           bash -n install-repo.sh
           bash tests/deploy-test.sh
+      - name: Validate real UFW before publication
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ufw iptables iproute2
+          sudo unshare --mount --net --propagation private bash tests/ufw-integration.sh
       - name: Install repository index tools
         run: |
           sudo apt-get update -qq

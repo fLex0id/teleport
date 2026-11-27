@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-VERSION=2.2.2
+VERSION=2.2.3
 BASE=https://flex0id.github.io/teleport
 REPO_HOST=flex0id.github.io
 REPO_IPS=(185.199.108.153 185.199.109.153 185.199.110.153 185.199.111.153)
@@ -289,11 +289,10 @@ time_check(){
 }
 # Resume only deployments explicitly started by this installer.
 wait_agent(){
-  local n result
+  local n
   for n in {1..45}; do
     if systemctl is-active --quiet teleport &&
-      result=$(timeout 5 teleport debug readyz 2>/dev/null) &&
-      python3 -I -c 'import json,sys; sys.exit(json.load(sys.stdin).get("status") != "ok")' <<<"$result" 2>/dev/null; then
+      timeout 5 teleport debug readyz >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
@@ -525,7 +524,7 @@ begin = "# BEGIN TELEPORT-DEPLOY OPENSSH"
 end = "# END TELEPORT-DEPLOY OPENSSH"
 if action == "remove":
     # Remove only our marker lines and exact tagged rules, not administrator edits.
-    owned = re.compile(r"^-A (?:ufw|ufw6)-before-input -p tcp -m tcp --dport [0-9]+ -m comment --comment teleport-deploy-openssh -j DROP$")
+    owned = re.compile(r"^-A (?:ufw|ufw6)-before-input -p tcp -m tcp --dport [0-9]+(?: -m conntrack --ctstate NEW)? -m comment --comment teleport-deploy-openssh -j DROP$")
     lines = original.splitlines(keepends=True)
     updated = "".join(line for line in lines if line.rstrip("\r\n") not in (begin, end) and not owned.fullmatch(line.rstrip("\r\n")))
     if updated == original:
@@ -544,7 +543,7 @@ else:
         sys.exit("Missing UFW before-input chain")
     # Place after chain declarations, before any filter rules.
     pos = next((i for i in range(start+1,finish) if lines[i].lstrip().startswith(("-A ","-I "))), finish)
-    block = begin+"\n"+"".join("-A "+chain+" -p tcp -m tcp --dport "+v+" -m comment --comment teleport-deploy-openssh -j DROP\n" for v in ports)+end+"\n"
+    block = begin+"\n"+"".join("-A "+chain+" -p tcp -m tcp --dport "+v+" -m conntrack --ctstate NEW -m comment --comment teleport-deploy-openssh -j DROP\n" for v in ports)+end+"\n"
     lines.insert(pos, block)
     updated = "".join(lines)
 st = p.stat()
@@ -570,7 +569,7 @@ ufw_verify_chain(){
   mapfile -t actual < <(printf '%s\n' "$rules" | grep -F -- "-A $chain " || :)
   for port in "$@"; do
     line=${actual[i]:-}
-    [[ $line == "-A $chain -p tcp -m tcp --dport $port -m comment --comment teleport-deploy-openssh -j DROP" || $line == "-A $chain -p tcp -m tcp --dport $port -m comment --comment \"teleport-deploy-openssh\" -j DROP" ]] || { fail "UFW priority block not verified for TCP $port ($chain)."; return 1; }
+    [[ $line == "-A $chain -p tcp -m tcp --dport $port -m conntrack --ctstate NEW -m comment --comment teleport-deploy-openssh -j DROP" || $line == "-A $chain -p tcp -m tcp --dport $port -m conntrack --ctstate NEW -m comment --comment \"teleport-deploy-openssh\" -j DROP" ]] || { fail "UFW priority block not verified for TCP $port ($chain)."; return 1; }
     i=$((i+1))
   done
 }
