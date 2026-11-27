@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-VERSION=2.2.1
+VERSION=2.2.2
 BASE=https://flex0id.github.io/teleport
 REPO_HOST=flex0id.github.io
 REPO_IPS=(185.199.108.153 185.199.109.153 185.199.110.153 185.199.111.153)
@@ -140,7 +140,7 @@ dns_restore(){
   return 0
 }
 dns_stamp(){
-  python3 - "$@" <<'PY'
+  python3 -I - "$@" <<'PY'
 import base64,struct,sys
 ip,host,path=sys.argv[1:]
 def lp(s):
@@ -198,7 +198,7 @@ dns_change(){
       if [[ $PM == apt ]]; then run "Refresh APT" apt-get -o DPkg::Lock::Timeout=120 update && run "Install DNS tools" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y dnsutils || return 1
       else run "Install DNS tools" dnf -y install bind-utils || return 1; fi
     fi
-    if [[ $mode == 2 && $PM == apt ]]; then run "Install DoH prerequisites" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y python3 ca-certificates || return 1; fi
+    if [[ $mode == 2 && $PM == apt ]]; then run "Refresh APT for DoH" apt-get -o DPkg::Lock::Timeout=120 update || return 1; run "Install DoH prerequisites" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y python3 ca-certificates || return 1; fi
   fi
   if [[ $mode == 2 ]]; then
     if ! command -v dnscrypt-proxy >/dev/null; then
@@ -286,6 +286,18 @@ time_check(){
   yesno 'Continue only if the displayed time is accurate?'
 }
 # Resume only deployments explicitly started by this installer.
+wait_agent(){
+  local n result
+  for n in {1..45}; do
+    if systemctl is-active --quiet teleport &&
+      result=$(timeout 5 teleport debug readyz 2>/dev/null) &&
+      python3 -I -c 'import json,sys; sys.exit(json.load(sys.stdin).get("status") != "ok")' <<<"$result" 2>/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  fail 'Agent readiness not confirmed. Deployment remains pending. Check teleport debug readyz and journalctl -u teleport.'
+}
 deployment_begin(){
   local role=$1 endpoint=$2
   [[ ! -e $STATE/role && ! -e $STATE/deployment.pending ]] || return 1
@@ -301,8 +313,10 @@ deployment_resume(){
   { IFS= read -r role && IFS= read -r endpoint; } <"$STATE/deployment.pending" || return 1
   [[ $role == cluster || $role == agent ]] && domain_ok "$endpoint" || return 1
   if [[ ! -f $CONF ]]; then
-    fail 'Configuration was not installed. Use the original installation menu to retry.'
-    return 1
+    [[ ! -L $CONF ]] || { fail 'Unexpected configuration symlink.'; return 1; }
+    say 'Configuration was not installed. Retry the original deployment; the endpoint can be corrected.'
+    if [[ $role == cluster ]]; then main_install; else agent_install; fi
+    return $?
   fi
   [[ ! -L $CONF ]] || { fail 'Unexpected configuration symlink.'; return 1; }
   teleport configure --test="$CONF" || return 1
@@ -315,9 +329,7 @@ deployment_resume(){
   if [[ $role == cluster ]]; then
     wait_cluster || return 1
   else
-    sleep 5
-    systemctl is-active --quiet teleport || return 1
-    say 'Verify agent enrollment with tctl nodes ls on the main cluster.'
+    wait_agent || return 1
   fi
   deployment_finish "$role" || return 1
   say '[OK] Deployment resumed.'
@@ -327,7 +339,14 @@ deployment_prepare(){
   local role=$1 endpoint=$2 oldrole oldendpoint
   if [[ -f $STATE/deployment.pending ]]; then
     { IFS= read -r oldrole && IFS= read -r oldendpoint; } <"$STATE/deployment.pending" || return 1
-    [[ $role == "$oldrole" && $endpoint == "$oldendpoint" ]] || { fail 'Interrupted deployment has a different role or endpoint.'; return 1; }
+    [[ $role == "$oldrole" ]] || { fail 'Interrupted deployment has a different role.'; return 1; }
+    if [[ $endpoint != "$oldendpoint" ]]; then
+      [[ ! -e $CONF && ! -L $CONF ]] || { fail 'Existing configuration prevents endpoint change.'; return 1; }
+      if [[ -d /var/lib/teleport && -n $(ls -A /var/lib/teleport) ]]; then fail 'Existing Teleport data prevents endpoint change.'; return 1; fi
+      local pending
+      pending=$(mktemp "$STATE/.pending.XXXXXX") || return 1
+      printf '%s\n%s\n' "$role" "$endpoint" >"$pending" && mv -Tf "$pending" "$STATE/deployment.pending" || { rm -f "$pending"; return 1; }
+    fi
     return 0
   fi
   deployment_begin "$role" "$endpoint"
@@ -335,7 +354,7 @@ deployment_prepare(){
 existing_guard(){
   [[ ! -e $CONF && ! -L $CONF ]] || { fail "$CONF already exists; refusing overwrite."; return 1; }
   if [[ -d /var/lib/teleport && -n $(ls -A /var/lib/teleport) ]]; then fail 'Existing Teleport data; refusing overwrite.'; return 1; fi
-  if [[ -f $STATE/deployment.pending && ! -f $STATE/role ]]; then say 'Interrupted installation found; retry with the same role and endpoint.'; return 0; fi
+  if [[ -f $STATE/deployment.pending && ! -f $STATE/role ]]; then say 'Interrupted installation found; retry with the same role; endpoint may be corrected before configuration exists.'; return 0; fi
   if command -v teleport >/dev/null || systemctl cat teleport.service >/dev/null 2>&1; then fail 'Existing Teleport installation; use normal package updates or manual recovery.'; return 1; fi
 }
 open_https(){
@@ -392,7 +411,7 @@ main_install(){
   if [[ $mode == 1 ]]; then args+=(--acme --acme-email="$email"); else args+=(--cert-file="$cert" --key-file="$key"); fi
   teleport "${args[@]}" >"$TMP/cluster.yaml" || return 1
   # Use PyYAML from the distribution to edit structured configuration.
-  python3 - "$TMP/cluster.yaml" "$node" <<'PY' || return 1
+  python3 -I - "$TMP/cluster.yaml" "$node" <<'PY' || return 1
 import sys,yaml
 p,node=sys.argv[1:]
 with open(p) as f: c=yaml.safe_load(f)
@@ -421,7 +440,7 @@ agent_install(){
   ask_name 'Node name' "$(hostname -s)"; node=$ANSWER
   curl -4fsS --max-time 15 "https://$proxy/webapi/ping" >"$TMP/ping.json" || { fail 'Trusted HTTPS to cluster unavailable.'; return 1; }
   local cluster_version repo_version
-  cluster_version=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("server_version", ""))' <"$TMP/ping.json") || return 1
+  cluster_version=$(python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("server_version", ""))' <"$TMP/ping.json") || return 1
   repo_probe || return 1
   repo_fetch "$BASE/current-release.txt" "$TMP/current-release.txt" || return 1
   repo_version=$(cat "$TMP/current-release.txt") || return 1
@@ -443,7 +462,7 @@ agent_install(){
   install -m 0600 "$TMP/join-token" /etc/teleport/join-token || return 1
   rm -f "$TMP/join-token"
   teleport node configure --output="file://$TMP/agent.yaml" --proxy="$proxy:443" --token=/etc/teleport/join-token >/dev/null || return 1
-  python3 - "$TMP/agent.yaml" "$node" <<'PY' || return 1
+  python3 -I - "$TMP/agent.yaml" "$node" <<'PY' || return 1
 import sys,yaml
 p,node=sys.argv[1:]
 with open(p) as f:c=yaml.safe_load(f)
@@ -455,10 +474,10 @@ PY
   install -m 0600 "$TMP/agent.yaml" "$CONF" || return 1
   if command -v restorecon >/dev/null; then restorecon "$CONF" /etc/teleport/join-token || :; fi
   run 'Enable Teleport agent' systemctl enable --now teleport || return 1
-  sleep 5
-  systemctl is-active --quiet teleport || { fail 'Agent not running; inspect journalctl -u teleport.'; return 1; }
+  wait_agent || return 1
   deployment_finish agent || return 1
-  say 'Agent process is running (not yet proof of enrollment). Confirm actual enrollment on the main server with: tctl nodes ls'
+  say '[OK] Agent readiness confirmed by Auth Service heartbeat.'
+  say 'Verify node visibility with tctl nodes ls on the main cluster.'
   say 'No inbound SSH port has been opened.'
   ssh_offer
 }
@@ -485,60 +504,107 @@ ssh_ports(){
     systemctl show "$u" -p Listen --value | grep -oE ':[0-9]+ \(Stream\)|^[0-9]+ \(Stream\)' | grep -oE '[0-9]+' || :
   done
 }
-# Snapshot UFW rules before modifying simple port entries; refuse unsafe restore.
-ufw_rows(){
-  ufw status numbered | awk -v p="$1" '
-    /^\[[[:space:]]*[0-9]+\]/ {
-      s=$0; sub(/^\[[[:space:]]*/, "", s); n=s; sub(/\].*$/, "", n)
-      sub(/^[^]]+\][[:space:]]*/, "", s)
-      split(s,a,/[[:space:]]+/)
-      if(a[1]==p"/tcp" || a[1]==p) {
-        if(a[2]=="(v6)") {family=6; action=a[3]; rest=4}
-        else {family=4; action=a[2]; rest=3}
-        if(a[rest]=="IN") rest++
-        if(a[rest]=="Anywhere" && (a[rest+1]=="" || a[rest+1]=="(v6)") && a[rest+2]=="")
-          print n, family, action, a[1]
-      }
-    }'
+# Own a marked block in UFW's before-input chain, ahead of user rules.
+# No user rules are removed or rewritten. Restore removes only our block.
+ufw_ipv6(){
+  [[ -d /proc/sys/net/ipv6 ]] && grep -Eq '^[[:space:]]*IPV6=yes([[:space:]]|$)' /etc/default/ufw &&
+    [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1) == 0 ]]
 }
-ufw_close_port(){
-  local port=$1 rows n family action spec first4 first6 status
-  rows=$(ufw_rows "$port") || return 1
-  while read -r n family action spec; do
-    [[ -n $n ]] || continue
-    case "$action" in ALLOW|LIMIT) ufw --force delete "$n" || return 1;; esac
-  done < <(printf '%s\n' "$rows" | sort -rn)
-  rows=$(ufw_rows "$port") || return 1
-  first4=$(awk '$2==4{print $3;exit}' <<<"$rows")
-  first6=$(awk '$2==6{print $3;exit}' <<<"$rows")
-  if [[ $first4 != DENY && $first4 != REJECT ]]; then
-    status=$(ufw status numbered) || return 1
-    if grep -Eq '^\[[[:space:]]*[0-9]+\]' <<<"$status"; then
-      ufw insert 1 deny in proto tcp to any port "$port" || return 1
-    else
-      ufw deny in proto tcp to any port "$port" || return 1
-    fi
-  fi
-  rows=$(ufw_rows "$port") || return 1
-  first4=$(awk '$2==4{print $3;exit}' <<<"$rows")
-  first6=$(awk '$2==6{print $3;exit}' <<<"$rows")
-  [[ $first4 == DENY || $first4 == REJECT ]] || { fail "UFW did not block TCP $port (IPv4)."; return 1; }
-  if grep -Eq '^[[:space:]]*IPV6=yes' /etc/default/ufw; then
-    [[ $first6 == DENY || $first6 == REJECT ]] || { fail "UFW did not block TCP $port (IPv6)."; return 1; }
-  fi
-  say "[OK] UFW deny/reject verified for TCP $port."
+ufw_edit(){
+  python3 -I - "$@" <<'PYUFW'
+import os, re, stat, sys, tempfile
+from pathlib import Path
+action, filename, chain, *ports = sys.argv[1:]
+p = Path(filename)
+if p.is_symlink() or not p.is_file():
+    sys.exit("Unexpected UFW rules file: " + filename)
+original = p.read_text()
+begin = "# BEGIN TELEPORT-DEPLOY OPENSSH"
+end = "# END TELEPORT-DEPLOY OPENSSH"
+pattern = re.compile(r"(?m)^" + re.escape(begin) + r"\n(?:[^\n]*\n)*?^" + re.escape(end) + r"\n")
+if action == "remove":
+    updated, count = pattern.subn("", original)
+    if count > 1 or begin in updated or end in updated:
+        sys.exit("Malformed managed UFW block: " + filename)
+    if count == 0:
+        sys.exit(0)
+else:
+    if begin in original or end in original:
+        sys.exit("Managed UFW block already exists: " + filename)
+    if not ports or not all(v.isdigit() and 0 < int(v) <= 65535 for v in ports):
+        sys.exit("Invalid ports")
+    lines = original.splitlines(keepends=True)
+    start = next((i for i, line in enumerate(lines) if line.strip() == "*filter"), None)
+    if start is None:
+        sys.exit("Missing filter table")
+    finish = next((i for i in range(start+1,len(lines)) if lines[i].strip() == "COMMIT"), None)
+    if finish is None or not any(line.startswith(":"+chain+" ") for line in lines[start+1:finish]):
+        sys.exit("Missing UFW before-input chain")
+    # Place after chain declarations, before any filter rules.
+    pos = next((i for i in range(start+1,finish) if lines[i].lstrip().startswith(("-A ","-I "))), finish)
+    block = begin+"\n"+"".join("-A "+chain+" -p tcp -m tcp --dport "+v+" -j DROP\n" for v in ports)+end+"\n"
+    lines.insert(pos, block)
+    updated = "".join(lines)
+st = p.stat()
+fd, name = tempfile.mkstemp(prefix=".teleport-ufw-", dir=p.parent)
+try:
+    with os.fdopen(fd,"w") as f:
+        f.write(updated)
+        f.flush()
+        os.fsync(f.fileno())
+        os.fchown(f.fileno(),st.st_uid,st.st_gid)
+        os.fchmod(f.fileno(),stat.S_IMODE(st.st_mode))
+    os.replace(name,p)
+finally:
+    if os.path.exists(name):
+        os.unlink(name)
+PYUFW
 }
-ufw_snapshot(){
-  local backup=$1
-  cp -a /etc/ufw/user.rules "$backup/user.rules" || return 1
-  cp -a /etc/ufw/user6.rules "$backup/user6.rules" || return 1
-  sha256sum /etc/ufw/user.rules /etc/ufw/user6.rules >"$backup/ufw.before" || return 1
+ufw_verify_chain(){
+  local tool=$1 chain=$2; shift 2
+  local rules port line i=0
+  rules=$("$tool" -S "$chain") || return 1
+  local -a actual=()
+  mapfile -t actual < <(printf '%s\n' "$rules" | grep -F -- "-A $chain " || :)
+  for port in "$@"; do
+    line=${actual[i]:-}
+    [[ $line == "-A $chain -p tcp -m tcp --dport $port -j DROP" ]] || { fail "UFW priority block not verified for TCP $port ($chain)."; return 1; }
+    i=$((i+1))
+  done
+}
+ufw_lockdown(){
+  local backup=$1; shift
+  local file chain
+  : >"$backup/ufw.managed" || return 1
+  for file in /etc/ufw/before.rules /etc/ufw/before6.rules; do
+    if [[ $file == */before6.rules ]]; then
+      ufw_ipv6 || continue
+      chain=ufw6-before-input
+    else chain=ufw-before-input; fi
+    cp -a "$file" "$backup/${file##*/}" || return 1
+    # Record only after successful edit; retain on subsequent reload failures.
+    ufw_edit add "$file" "$chain" "$@" || return 1
+    printf '%s\n' "$file" >>"$backup/ufw.managed" || return 1
+  done
+  ufw reload || return 1
+  ufw_verify_chain iptables ufw-before-input "$@" || return 1
+  if ufw_ipv6; then ufw_verify_chain ip6tables ufw6-before-input "$@" || return 1; fi
+  say '[OK] UFW before-input port blocks verified; existing user rules preserved.'
 }
 ufw_restore_snapshot(){
-  local backup=$1
+  local backup=$1 file
+  if [[ -f $backup/ufw.managed ]]; then
+    while IFS= read -r file; do
+      case "$file" in /etc/ufw/before.rules|/etc/ufw/before6.rules) :;; *) return 1;; esac
+      ufw_edit remove "$file" unused || return 1
+    done <"$backup/ufw.managed"
+    ufw reload || return 1
+    return 0
+  fi
+  # Compatibility with backups created by versions <= 2.2.1.
   [[ -f $backup/ufw.before ]] || return 0
   if [[ -f $backup/ufw.after ]] && ! sha256sum -c "$backup/ufw.after" >/dev/null 2>&1; then
-    fail "UFW changed since lockdown; refusing to overwrite administrator changes. Backup: $backup"
+    fail "Legacy UFW backup differs from current rules. Manual merge required: $backup"
     return 1
   fi
   cp -a "$backup/user.rules" /etc/ufw/user.rules && cp -a "$backup/user6.rules" /etc/ufw/user6.rules && ufw reload
@@ -591,7 +657,7 @@ ssh_ready(){
   local role; role=$(cat "$STATE/role") || return 1
   case "$role" in
     cluster) tctl status >/dev/null 2>&1 || { fail 'Teleport Auth Service is not healthy.'; return 1; };;
-    agent) say 'Confirm the node is registered in the cluster (tctl nodes ls).';;
+    agent) wait_agent || return 1; say 'Confirm the node is registered in the cluster (tctl nodes ls).';;
     *) fail 'Unknown deployment role.'; return 1;;
   esac
   say 'Test an actual NEW Teleport SSH session to this node from your workstation.'
@@ -663,11 +729,7 @@ ssh_lockdown(){
     done
     say 'OpenSSH reject rules added to firewalld zones; higher-priority custom rules may override them.'
   elif command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
-    ufw_snapshot "$backup" || return 1
-    for port in "${ports[@]}"; do
-      ufw_close_port "$port" || return 1
-    done
-    sha256sum /etc/ufw/user.rules /etc/ufw/user6.rules >"$backup/ufw.after" || return 1
+    ufw_lockdown "$backup" "${ports[@]}" || return 1
   else
     say 'No supported active firewalld/UFW detected; OpenSSH listeners are disabled, but firewall rules were not changed.'
     say 'Existing nftables/iptables and provider firewall remain unchanged.'
