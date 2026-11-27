@@ -49,8 +49,38 @@ skip_if_unavailable=0
 metadata_expire=1h
 REPO
     chmod 644 /etc/yum.repos.d/flex0id-teleport.repo
+    # Disable vendor-specific repositories, preserving unrelated sections.
+    python3 - <<'PYRPM'
+from pathlib import Path
+import re
+import shutil
+
+for path in sorted(Path("/etc/yum.repos.d").glob("*.repo")):
+    if path.name == "flex0id-teleport.repo":
+        continue
+    original = path.read_text(encoding="utf-8")
+    sections = re.split(r"(?m)(?=^[ \t]*\[[^\]\n]+\][ \t]*$)", original)
+    for i, stanza in enumerate(sections):
+        if not re.match(r"^[ \t]*\[", stanza):
+            continue
+        urls = re.findall(r"(?mi)^[ \t]*(?:baseurl|mirrorlist|metalink)[ \t]*=[ \t]*([^\n]+)", stanza)
+        if not any("yum.releases.teleport.dev" in url or "rpm.releases.teleport.dev" in url for url in urls):
+            continue
+        if re.search(r"(?mi)^[ \t]*enabled[ \t]*=", stanza):
+            stanza = re.sub(r"(?mi)^[ \t]*enabled[ \t]*=[^\n]*", "enabled=0", stanza)
+        else:
+            stanza = stanza.rstrip("\n") + "\nenabled=0\n\n"
+        sections[i] = stanza
+    updated = "".join(sections)
+    if updated != original:
+        backup = path.with_name(path.name + ".before-flex0id-teleport.bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        path.write_text(updated, encoding="utf-8")
+        print(f"Disabled competing official Teleport RPM source: {path}")
+PYRPM
     echo 'DNF repository installed. Verification:'
-    dnf makecache --refresh --disablerepo='*' --enablerepo='flex0id-teleport'
+    dnf -y makecache --refresh --disablerepo='*' --enablerepo='flex0id-teleport'
     dnf repoquery --disablerepo='*' --enablerepo='flex0id-teleport' --available teleport || true
 elif command -v apt-get >/dev/null && [[ -f /etc/debian_version ]]; then
     [[ "$arch" == x86_64 ]] || { echo "Unsupported APT architecture: $arch" >&2; exit 1; }
@@ -88,14 +118,16 @@ import shutil
 root = Path("/etc/apt")
 paths = [root / "sources.list", *sorted((root / "sources.list.d").glob("*.list")),
          *sorted((root / "sources.list.d").glob("*.sources"))]
-host = "apt.releases.teleport.dev"
+hosts = ("apt.releases.teleport.dev", "flex0id.github.io/reverse-proxy/apt")
+def matches(value):
+    return any(host in value for host in hosts)
 edits = []
 
 for path in paths:
     if not path.is_file() or path.name == "flex0id-teleport.list":
         continue
     original = path.read_text(encoding="utf-8")
-    if host not in original:
+    if not matches(original):
         continue
     if path.suffix == ".sources":
         # Deb822: disable only the Teleport-specific stanza.
@@ -103,10 +135,10 @@ for path in paths:
         for i in range(0, len(sections), 2):
             stanza = sections[i]
             uris = re.findall(r"(?mi)^URIs:[ \t]*([^\n]+)", stanza)
-            if not any(host in uri for uri in uris):
+            if not any(matches(uri) for uri in uris):
                 continue
             urls = re.findall(r"https?://[^\s]+", " ".join(uris))
-            if not urls or any(host not in url for url in urls):
+            if not urls or any(not matches(url) for url in urls):
                 raise SystemExit(f"Refusing to disable mixed-URI APT stanza in {path}")
             if re.search(r"(?mi)^Enabled:[ \t]*no[ \t]*$", stanza):
                 continue
@@ -122,7 +154,7 @@ for path in paths:
         # lines; preserve all unrelated entries within the same file.
         lines = []
         for line in original.splitlines(keepends=True):
-            if (host in line and
+            if (matches(line) and
                     re.match(r"^[ \t]*deb(?:-src)?[ \t]+", line)):
                 lines.append("# Disabled by flex0id-teleport: " + line)
             else:
