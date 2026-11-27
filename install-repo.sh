@@ -40,7 +40,14 @@ fi
 if (( ${#missing[@]} > 0 )); then
     echo "[INFO] Installing missing prerequisites: ${missing[*]}"
     if [[ "$pm" == dnf ]]; then
-        dnf -y --disablerepo=flex0id-teleport install "${missing[@]}" || {
+        # Only disable an existing managed repository; a fresh host has none.
+        dnf_args=(-y)
+        if [[ -f /etc/yum.repos.d/flex0id-teleport.repo ]]; then
+            if grep -Eq '^[[:space:]]*\[flex0id-teleport\][[:space:]]*$' /etc/yum.repos.d/flex0id-teleport.repo; then
+                dnf_args+=(--disablerepo=flex0id-teleport)
+            fi
+        fi
+        dnf "${dnf_args[@]}" install "${missing[@]}" || {
             echo '[ERROR] Cannot install prerequisites from system repositories. Check DNS and DNF repositories.' >&2
             exit 1
         }
