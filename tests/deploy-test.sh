@@ -112,4 +112,49 @@ declare -f dns_change dns_test dns_restore >"$scratch/dns-functions"
 if grep -Eq 'repo_probe|repo_fetch|repo_run|--resolve' "$scratch/dns-functions"; then exit 1; fi
 ok 'DNS management is independent of repository fallback'
 
+
+# OpenSSH tests: all system commands mocked; use only scratch state.
+STATE=$scratch/state
+mkdir -p "$STATE"
+SSH_PENDING=0
+ssh_ready(){ return 0; }
+ssh_units(){ printf '%s\n' ssh.socket ssh.service; }
+ssh_ports(){ printf '%s\n' 22 2222; }
+yesno(){ return 0; }
+ss(){ :; }
+systemctl(){
+  printf '%s\n' "$*" >>"$scratch/systemctl"
+  case "$1" in
+    is-enabled) if [[ -f "$scratch/masked-$2" ]]; then echo masked; else echo enabled; fi;;
+    is-active) if [[ $2 == --quiet && $3 == firewalld ]]; then return 1; else echo active; fi;;
+    mask) touch "$scratch/masked-$2";;
+    unmask) rm -f "$scratch/masked-$2";;
+    *) :;;
+  esac
+}
+ufw(){ if [[ $1 == status ]]; then echo 'Status: inactive'; else return 1; fi; }
+ssh_lockdown
+[[ $SSH_PENDING == 0 && -f $(ssh_state)/units ]]
+grep -q '^stop ssh.socket
+ "$scratch/systemctl"
+grep -q '^mask ssh.service
+ "$scratch/systemctl"
+ok 'OpenSSH socket and service disabled'
+ssh_restore
+[[ ! -e $(ssh_state) ]]
+grep -q '^unmask ssh.service
+ "$scratch/systemctl"
+grep -q '^start ssh.socket
+ "$scratch/systemctl"
+ok 'OpenSSH original service state restored'
+ssh_ports(){ printf '%s\n' 443; }
+if ssh_lockdown; then exit 1; fi
+[[ ! -e $(ssh_state) ]]
+ok 'Teleport port overlap rejected'
+ssh_ports(){ printf '%s\n' 22; }
+ssh_ready(){ return 1; }
+if ssh_lockdown; then exit 1; fi
+[[ ! -e $(ssh_state) ]]
+ok 'OpenSSH changes blocked without access confirmation'
+
 printf '%s tests passed\n' "$count"
