@@ -135,17 +135,13 @@ systemctl(){
 ufw(){ if [[ $1 == status ]]; then echo 'Status: inactive'; else return 1; fi; }
 ssh_lockdown
 [[ $SSH_PENDING == 0 && -f $(ssh_state)/units ]]
-grep -q '^stop ssh.socket
- "$scratch/systemctl"
-grep -q '^mask ssh.service
- "$scratch/systemctl"
+grep -Fqx 'stop ssh.socket' "$scratch/systemctl"
+grep -Fqx 'mask ssh.service' "$scratch/systemctl"
 ok 'OpenSSH socket and service disabled'
 ssh_restore
 [[ ! -e $(ssh_state) ]]
-grep -q '^unmask ssh.service
- "$scratch/systemctl"
-grep -q '^start ssh.socket
- "$scratch/systemctl"
+grep -Fqx 'unmask ssh.service' "$scratch/systemctl"
+grep -Fqx 'start ssh.socket' "$scratch/systemctl"
 ok 'OpenSSH original service state restored'
 ssh_ports(){ printf '%s\n' 443; }
 if ssh_lockdown; then exit 1; fi
