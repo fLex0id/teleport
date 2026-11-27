@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Architecture](https://img.shields.io/badge/architecture-x86__64-blue) ![Packages](https://img.shields.io/badge/packages-RPM%20%7C%20DEB-blue)
 
-Независимый репозиторий оригинальных пакетов Teleport с поддержкой штатной установки и обновления через APT и DNF. Метаданные репозитория защищены GPG-подписью.
+Независимый репозиторий оригинальных пакетов Teleport Server (`teleport`) и Teleport Connect (`teleport-connect`) с поддержкой штатной установки и обновления через APT и DNF. Метаданные репозитория защищены GPG-подписью.
 
 **[Релизы](https://github.com/fLex0id/teleport/releases)** · **[Текущая версия](https://flex0id.github.io/teleport/current-release.txt)** · **[Репозиторий пакетов](https://flex0id.github.io/teleport/)**
 
@@ -15,7 +15,7 @@
 
 ## 1. Подключение репозитория
 
-Выполните один раз на каждом Linux-сервере. Требуются Bash, curl, GnuPG, Python 3 и права администратора.
+Выполните один раз на каждом Linux-сервере или рабочей станции. Требуются Bash, curl, GnuPG, Python 3 и права администратора.
 
 Скачайте установщик и запустите его с указанным отпечатком публичного ключа.
 
@@ -40,12 +40,16 @@ TELEPORT_REPO_EXPECTED_FPR=95AB1A0D022288C96B135E395D6220FDB9C74356 bash /tmp/in
 
 ~~~bash
 sudo dnf install -y teleport
+# Teleport Connect (desktop client)
+sudo dnf install -y teleport-connect
 ~~~
 
 **Ubuntu / Debian**
 
 ~~~bash
 sudo apt update && sudo apt install -y teleport
+# Teleport Connect (desktop client)
+sudo apt install -y teleport-connect
 ~~~
 
 ## 3. Обновление Teleport
@@ -64,19 +68,21 @@ sudo dnf update -y
 sudo apt update && sudo apt dist-upgrade -y
 ~~~
 
-Эти команды обновляют также остальные системные пакеты. Для обновления только Teleport:
+Эти команды обновляют также остальные системные пакеты. Для отдельного обновления Teleport Server или Teleport Connect (выберите установленный пакет):
 
 ~~~bash
 sudo dnf upgrade -y teleport
+sudo dnf upgrade -y teleport-connect
 ~~~
 
 ~~~bash
 sudo apt update && sudo apt install --only-upgrade -y teleport
+sudo apt install --only-upgrade -y teleport-connect
 ~~~
 
 Если команды выполняются под root, sudo не требуется.
 
-Репозиторий содержит последнюю успешно опубликованную стабильную серверную версию из GitHub Releases. Teleport Connect и другие дополнительные дистрибутивы доступны в Releases, но не индексируются в APT/DNF.
+Репозиторий содержит последнюю успешно опубликованную стабильную версию Teleport Server и Teleport Connect из GitHub Releases. Windows Installer доступен в Releases, но не индексируется в APT/DNF. Пакетные менеджеры обновляют только уже установленные пакеты: подключение репозитория не устанавливает сервер или клиент автоматически.
 
 > Перед обновлением основных версий ознакомьтесь с требованиями производителя, сделайте резервную копию и соблюдайте порядок обновления компонентов кластера. Установка пакета не гарантирует перезапуск уже работающей службы.
 
@@ -85,18 +91,18 @@ sudo apt update && sudo apt install --only-upgrade -y teleport
 **Rocky Linux**
 
 ~~~bash
-dnf list --showduplicates teleport
+dnf list --showduplicates teleport teleport-connect
 ~~~
 
 **Ubuntu / Debian**
 
 ~~~bash
-apt-cache policy teleport
+apt-cache policy teleport teleport-connect
 ~~~
 
 Убедитесь, что пакет предлагается из `https://flex0id.github.io/teleport/`. Если имеются дополнительные нестандартные источники пакета, отключите их, не затрагивая системные репозитории.
 
-Проверка установленной версии:
+Проверка установленной версии сервера:
 
 ~~~bash
 teleport version
