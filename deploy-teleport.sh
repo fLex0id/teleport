@@ -4,8 +4,11 @@
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
-VERSION=2.0.0
+VERSION=2.1.0
 BASE=https://flex0id.github.io/teleport
+REPO_HOST=flex0id.github.io
+REPO_IPS=(185.199.108.153 185.199.109.153 185.199.110.153 185.199.111.153)
+REPO_FALLBACK_IP=
 FPR=95AB1A0D022288C96B135E395D6220FDB9C74356
 CONF=/etc/teleport.yaml
 STATE=/var/lib/teleport-deploy
@@ -25,6 +28,72 @@ ask_domain(){ while :; do ask "$1"; if domain_ok "$ANSWER"; then return; fi; say
 ask_name(){ while :; do ask "$1 [$2]"; ANSWER=${ANSWER:-$2}; [[ $ANSWER =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$ ]] && return; say 'Use ASCII letters, digits, dots, hyphens or underscores.'; done; }
 run(){ local desc=$1; shift; say "$desc ..."; if "$@" >>"$LOG" 2>&1; then say '[OK]'; else say "[ERROR] See $LOG"; tail -n 12 "$LOG" >&2; return 1; fi; }
 fetch(){ curl -4fsSL --retry 3 --connect-timeout 15 --max-time 120 "$1" -o "$2"; }
+# Only GitHub Pages downloads use this fallback. Never modify system DNS or /etc/hosts.
+# curl exit 6 means the target hostname could not be resolved.
+repo_probe(){
+  local rc ip resolver candidate
+  local -a candidates=()
+  REPO_FALLBACK_IP=
+  if curl -4fsS --connect-timeout 8 --max-time 15 "$BASE/current-release.txt" -o /dev/null; then
+    say '[OK] Repository available through normal DNS.'
+    return 0
+  else rc=$?; fi
+  if ((rc != 6)); then
+    fail "Repository HTTPS failed (curl $rc); DNS fallback not applicable."
+    return 1
+  fi
+  say '[WARN] Repository DNS failed. Trying temporary fallback.'
+  if command -v dig >/dev/null 2>&1; then
+    for resolver in 9.9.9.9 1.1.1.1 8.8.8.8; do
+      while IFS= read -r candidate; do
+        if ip_ok "$candidate"; then candidates+=("$candidate"); fi
+      done < <(dig @"$resolver" "$REPO_HOST" A +time=2 +tries=1 +short 2>/dev/null || :)
+      (("${#candidates[@]}" > 0)) && break
+    done
+  fi
+  candidates+=("${REPO_IPS[@]}")
+  local seen=' '
+  for ip in "${candidates[@]}"; do
+    [[ $seen != *" $ip "* ]] || continue
+    seen+="$ip "
+    if curl -4fsS --noproxy "$REPO_HOST" --connect-timeout 5 --max-time 12 \
+      --resolve "$REPO_HOST:443:$ip" "$BASE/current-release.txt" -o /dev/null; then
+      REPO_FALLBACK_IP=$ip
+      say "[OK] Temporary repository address: $ip"
+      return 0
+    fi
+  done
+  fail 'No reachable GitHub Pages address with valid TLS.'
+}
+repo_fetch(){
+  local url=$1 dest=$2
+  [[ $url == "$BASE/"* ]] || { fail 'Unexpected repository URL.'; return 1; }
+  if [[ -n $REPO_FALLBACK_IP ]]; then
+    curl -4fsSL --noproxy "$REPO_HOST" --resolve "$REPO_HOST:443:$REPO_FALLBACK_IP" \
+      --retry 2 --connect-timeout 10 --max-time 120 "$url" -o "$dest"
+  else
+    fetch "$url" "$dest"
+  fi
+}
+repo_run(){
+  if [[ -z $REPO_FALLBACK_IP ]]; then "$@"; return $?; fi
+  # A private mount namespace makes the mapping visible only to the child
+  # installer and package manager; DNS tests and the host remain untouched.
+  local hosts="$TMP/repository.hosts"
+  command -v unshare >/dev/null && command -v mount >/dev/null || {
+    fail 'Private mount namespace unavailable; restore working DNS first.'; return 1; }
+  {
+    printf '%s %s\n' "$REPO_FALLBACK_IP" "$REPO_HOST"
+    # Remove only the exact repository alias from copied hosts entries.
+    awk -v h="$REPO_HOST" '{if ($0 ~ /^[[:space:]]*#/ || NF<2) {print;next} s=$1; n=0; for(i=2;i<=NF;i++){if($i~/^#/)break; if(tolower($i)!=h){s=s" "$i;n++}} if(n) print s}' /etc/hosts
+  } >"$hosts" || return 1
+  chmod 644 "$hosts" || return 1
+  unshare --mount --propagation private bash -c '
+    mount --bind "$1" /etc/hosts || exit 1
+    shift
+    exec "$@"
+  ' bash "$hosts" "$@"
+}
 detect(){
   [[ $(uname -m) == x86_64 ]] || { fail 'Only x86_64 / amd64 packages are published.'; return 1; }
   [[ -d /run/systemd/system ]] || { fail 'systemd is required.'; return 1; }
@@ -69,7 +138,7 @@ PY
 dns_change(){
   [[ ! -e $DNSBACK ]] || { say 'Restore previous DNS configuration first (menu 4).'; return 1; }
   say '1 Quad9   2 Cloudflare   3 Google   4 Cisco OpenDNS'
-  say '5 NextDNS (DoH profile)   6 AdGuard   7 Custom UDP   0 Keep current'
+  say '5 NextDNS (UDP / DoH profile)   6 AdGuard   7 Custom UDP   0 Keep current'
   choice 'DNS provider [0]:' 0 7
   local p=$ANSWER ips host path=/dns-query mode ip stamp names='' i=0 bin
   case "$p" in
@@ -165,16 +234,18 @@ EOF
   if dns_test; then DNS_PENDING=0; say '[OK] DNS configured. Use menu 4 to restore.'; say 'Check NSS/systemd-resolved and DHCP configuration if applications use another resolver or DNS changes after reboot.'; else dns_restore || :; DNS_PENDING=0; return 1; fi
 }
 install_package(){
-  fetch https://raw.githubusercontent.com/fLex0id/teleport/main/install-repo.sh "$TMP/install-repo.sh" || return 1
-  run 'Configure signed Teleport repository' env TELEPORT_REPO_EXPECTED_FPR="$FPR" bash "$TMP/install-repo.sh" || return 1
+  repo_probe || return 1
+  repo_fetch "$BASE/install-repo.sh" "$TMP/install-repo.sh" || return 1
+  run 'Configure signed Teleport repository' repo_run env TELEPORT_REPO_EXPECTED_FPR="$FPR" bash "$TMP/install-repo.sh" || return 1
   if [[ $PM == apt ]]; then
-    local version; version=$(curl -4fsSL --max-time 30 "$BASE/current-release.txt") || return 1
+    local version; repo_fetch "$BASE/current-release.txt" "$TMP/current-release.txt" || return 1
+    version=$(cat "$TMP/current-release.txt") || return 1
     version=$(printf '%s' "$version" | sed -E 's/^(teleport-v|v)//')
     apt-cache madison teleport | awk -F'|' -v v="$version" '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if ($2==v && $3 ~ /https:\/\/flex0id[.]github[.]io\/teleport\/apt/) found=1} END{exit !found}' || return 1
     [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail 'No valid package candidate'; return 1; }
-    run "Install Teleport $version" env DEBIAN_FRONTEND=noninteractive apt-get install -y "teleport=$version"
+    run "Install Teleport $version" repo_run env DEBIAN_FRONTEND=noninteractive apt-get install -y "teleport=$version"
   else
-    run 'Install Teleport from managed repository' dnf -y install teleport --setopt=flex0id-teleport.priority=1
+    run 'Install Teleport from managed repository' repo_run dnf -y install teleport --setopt=flex0id-teleport.priority=1
   fi
 }
 time_check(){
@@ -271,7 +342,9 @@ agent_install(){
   curl -4fsS --max-time 15 "https://$proxy/webapi/ping" >"$TMP/ping.json" || { fail 'Trusted HTTPS to cluster unavailable.'; return 1; }
   local cluster_version repo_version
   cluster_version=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("server_version", ""))' <"$TMP/ping.json") || return 1
-  repo_version=$(curl -4fsSL --max-time 30 "$BASE/current-release.txt") || return 1
+  repo_probe || return 1
+  repo_fetch "$BASE/current-release.txt" "$TMP/current-release.txt" || return 1
+  repo_version=$(cat "$TMP/current-release.txt") || return 1
   cluster_version=$(printf '%s' "$cluster_version" | sed 's/^v//')
   repo_version=$(printf '%s' "$repo_version" | sed -E 's/^(teleport-v|v)//')
   if [[ ! $cluster_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! $repo_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then fail 'Could not verify cluster and repository versions.'; return 1; fi
